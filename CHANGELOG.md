@@ -2,6 +2,8 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [- fix(deps): registry vv0.4.1 地板对齐（零代码改动）
+
 ## [- fix(deps): logx 地板 v0.5.0 → v0.6.0、core 地板 v0.6.0 → v0.7.0（零代码改动）
 
 ## [v0.1.3] — 2026-10-17
