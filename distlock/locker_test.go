@@ -118,7 +118,7 @@ func TestGracefulDegradation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clientv3.New: %v", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 

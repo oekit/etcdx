@@ -71,7 +71,7 @@ func freeURL(t *testing.T) url.URL {
 	if err != nil {
 		t.Fatalf("grab free port: %v", err)
 	}
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	u, err := url.Parse(fmt.Sprintf("http://%s", l.Addr().String()))
 	if err != nil {
 		t.Fatalf("parse url: %v", err)

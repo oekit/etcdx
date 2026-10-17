@@ -78,7 +78,7 @@ func (r *Registrar) Register(ctx context.Context, inst regcore.Instance) error {
 	delete(r.regs, key)
 	r.mu.Unlock()
 	if old != nil {
-		r.stop(ctx, old)
+		_ = r.stop(ctx, old) // 旧注册清理失败不阻断新注册；旧租约由 TTL 兜底
 	}
 
 	leaseID, err := r.putWithLease(ctx, key, string(val))
@@ -99,7 +99,7 @@ func (r *Registrar) Register(ctx context.Context, inst regcore.Instance) error {
 	r.regs[key] = reg
 	r.mu.Unlock()
 
-	async.GoSafeLabeled("etcdx.registry.keepalive", func() { r.supervise(sctx, key, string(val), reg) })
+	async.GoSafe(func() { r.supervise(sctx, key, string(val), reg) })
 	log.Info("instance registered", "key", key, "lease", leaseID, "ttl", r.opt.TTL)
 	return nil
 }

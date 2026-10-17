@@ -81,7 +81,7 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 	c.listeners[key] = cancel
 	c.mu.Unlock()
 
-	async.GoSafeLabeled("etcdx.registry.config-watch", func() {
+	async.GoSafe(func() {
 		wch := c.cli.Watch(wctx, key, clientv3.WithRev(startRev))
 		for wresp := range wch {
 			if wresp.Canceled {

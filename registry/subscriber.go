@@ -57,7 +57,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 
 	cb(decodeAll(serviceName, s.opt.Group, resp))
 
-	async.GoSafeLabeled("etcdx.registry.watch", func() {
+	async.GoSafe(func() {
 		wch := s.cli.Watch(wctx, dir, clientv3.WithPrefix(), clientv3.WithRev(startRev))
 		for wresp := range wch {
 			if wresp.Canceled {

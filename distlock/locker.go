@@ -139,12 +139,21 @@ func (l *EtcdLocker) Lock(ctx context.Context, key string, ttl, timeout time.Dur
 	})
 }
 
-// acquire 统一加锁流程：建 Session → 建 Mutex → 执行具体加锁策略 → 记录持有。
-// 加锁失败一律关闭 Session 回收租约。
+// acquire 统一加锁流程：连接预检 → 建 Session → 建 Mutex → 执行具体加锁
+// 策略 → 记录持有。加锁失败一律关闭 Session 回收租约。
 func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	do func(ctx context.Context, m *concurrency.Mutex) error) (string, error) {
 	if key == "" {
 		return "", fmt.Errorf("etcdx distlock: key is empty")
+	}
+	// 连接预检：NewSession 的 Grant 走 Session 自身的后台 ctx，对不可达
+	// etcd 会无限等待；先用轻量读在有界窗口内探活，失败直接降级/报错，
+	// 不创建注定挂死的 Session
+	pctx, pcancel := context.WithTimeout(ctx, 3*time.Second)
+	_, perr := l.cli.Get(pctx, l.prefix)
+	pcancel()
+	if perr != nil {
+		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: etcd unreachable: %w", perr))
 	}
 	ttlSec := int(ttl / time.Second)
 	if ttlSec < 1 {

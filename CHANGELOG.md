@@ -28,7 +28,9 @@ github.com/oekit/etcdx                 # package etcdx — 客户端封装（模
   `github.com/oekit/registry/registry` v0.3.0，可与 registry/nacos 互换
 - **distlock**：Session（租约 TTL + 自动续约，崩溃兜底释放）+ concurrency.Mutex
   （revision 公平排队、Lock 阻塞等待而非轮询）；ownerID 进程内校验防误释放；
-  `WithGracefulDegradation` 可选无 etcd 降级放行；`WithOnLock` 指标钩子；
-  接口与 `redisx/distlock.Locker` 同形可互换
+  acquire 前置有界连接预检（3s 窗口）——不可达 etcd 直接降级/报错，
+  规避 `concurrency.NewSession` 的 Grant 无界等待；`WithGracefulDegradation`
+  可选无 etcd 降级放行；`WithOnLock` 指标钩子；接口与 `redisx/distlock.Locker`
+  同形可互换
 - 测试：内嵌 etcd 服务端（embed，内核随机端口），覆盖注册/发现/订阅推送/
   配置监听/锁互斥与超时/降级全链路，`-race` 全绿；CI 无需 docker
