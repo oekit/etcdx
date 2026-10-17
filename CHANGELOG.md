@@ -2,6 +2,12 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.1.1] — 2026-10-17
+
+- fix(distlock): acquire 前置 3s 连接预检防 NewSession 无界挂死；GoSafe 换已发布变体（GoSafeLabeled 未随 tag 发布）；errcheck 清零
+- fix(deps): 内部依赖地板全量对齐最新——concurrency → v0.5.2、logx v0.2.0 → v0.5.0、registry v0.3.0 → v0.3.1（core v0.6.0 indirect 跟随）
+- build: go 维持 1.26.0——etcd client v3 生态全家声明 go1.26，暂不做生态级回退
+
 ## [v0.1.0] — 2026-10-17
 
 首个版本。
