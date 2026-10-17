@@ -2,6 +2,10 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.1.3] — 2026-10-17
+
+- registry v0.4.0 导入路径升级（SPI 包提升至模块根：`github.com/oekit/registry/registry` → `github.com/oekit/registry`），代码零逻辑变化
+
 ## [v0.1.2] — 2026-10-17
 
 - concurrency 地板 v0.5.2 → v0.5.4
