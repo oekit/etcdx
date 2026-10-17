@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	regcore "github.com/oekit/registry/registry"
+	regcore "github.com/oekit/registry"
 
 	"github.com/oekit/etcdx/internal/testutil"
 )

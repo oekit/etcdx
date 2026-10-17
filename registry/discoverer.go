@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	regcore "github.com/oekit/registry/registry"
+	regcore "github.com/oekit/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 

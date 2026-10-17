@@ -1,5 +1,5 @@
 // Package etcdx 提供 etcd 客户端全家——客户端封装（根包）、注册发现实现
-// （registry，实现 github.com/oekit/registry/registry SPI）、分布式锁
+// （registry，实现 github.com/oekit/registry SPI）、分布式锁
 // （distlock，与 redisx/distlock.Locker 接口形态一致可互换）。
 //
 // 零可观测性副作用：不自动注入任何 tracing/logger 后端，SDK 内部统一

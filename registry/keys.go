@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	regcore "github.com/oekit/registry/registry"
+	regcore "github.com/oekit/registry"
 )
 
 // serviceDir 返回某服务全部实例键的公共前缀（含尾部 "/"，供 WithPrefix 使用）。

@@ -1,4 +1,4 @@
-// Package registry 是 github.com/oekit/registry/registry SPI 的 etcd 实现：
+// Package registry 是 github.com/oekit/registry SPI 的 etcd 实现：
 // Registrar（Lease + KeepAlive 注册，租约丢失自动重注册）、Discoverer
 // （prefix 拉取）、Subscriber（prefix Watch 推送）、ConfigStore（KV Watch
 // 配置监听）。上层 nns 等依赖 SPI 接口而非本包，可与 registry/nacos 互换。
@@ -18,7 +18,7 @@
 // # 用法
 //
 //	import (
-//	    regcore "github.com/oekit/registry/registry"
+//	    regcore "github.com/oekit/registry"
 //	    "github.com/oekit/etcdx/registry"
 //	)
 //
