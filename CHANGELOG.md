@@ -2,6 +2,10 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.1.2] — 2026-10-17
+
+- concurrency 地板 v0.5.2 → v0.5.4
+
 ## [v0.1.1] — 2026-10-17
 
 - fix(distlock): acquire 前置 3s 连接预检防 NewSession 无界挂死；GoSafe 换已发布变体（GoSafeLabeled 未随 tag 发布）；errcheck 清零
