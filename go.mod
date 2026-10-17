@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/oekit/concurrency v0.5.4
-	github.com/oekit/logx v0.5.0
+	github.com/oekit/logx v0.6.0
 	github.com/oekit/registry v0.4.0
 	go.etcd.io/etcd/api/v3 v3.7.2
 	go.etcd.io/etcd/client/v3 v3.7.2
@@ -30,7 +30,7 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/jonboulle/clockwork v0.5.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/oekit/core v0.6.0 // indirect
+	github.com/oekit/core v0.7.0 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
