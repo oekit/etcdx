@@ -1,7 +1,7 @@
 # AGENTS.md — oekit/etcdx
 
 > etcd 全家——客户端封装（根包：生产默认值/Health 探活/Close(ctx) 幂等）、registry 注册发现实现（SPI 对接 registry/nacos 链路：Lease KeepAlive 注册 + 丢约指数退避自动重注册、prefix Watch 订阅推送、ConfigStore KV 配置监听）、distlock 分布式锁（Session+concurrency.Mutex 公平排队，接口与 redisx/distlock.Locker 同形可互换，可选无 etcd 降级放行）
-> 当前版本：`v0.1.0` · module：`github.com/oekit/etcdx` · org：[oekit = Open Easy Kit](https://oekit.github.io)
+> 当前版本：`v0.1.1` · module：`github.com/oekit/etcdx` · org：[oekit = Open Easy Kit](https://oekit.github.io)
 
 ## 本仓包含
 `./`、`distlock/`、`internal/testutil/`、`registry/`
