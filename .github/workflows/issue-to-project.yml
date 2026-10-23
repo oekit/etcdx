@@ -1,0 +1,64 @@
+# 各模块仓放置于 .github/workflows/issue-to-project.yml
+# 目的：issue/PR 开闭、tag 推送、README 安装行变更 → 立刻进/刷 org 大盘。
+# 依赖 oekit/.github 的 scripts/sync-projects.py（checkout 下游仓复用）。
+
+name: 即时入板
+
+on:
+  issues:
+    types: [opened, closed, reopened]
+  pull_request:
+    types: [opened, closed, reopened]
+  push:
+    # 根 tag（v0.6.0）与嵌套 tag（hlog/v0.1.2）都算发版
+    tags: ['*']
+    branches: [main, master]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  # group 必须带 event_name 与条目号，否则 events / pull_request / push 三类事件
+  # 会落进同一个 group（events 与 push:main 的 github.ref 都是 refs/heads/main）
+  # 而互相 cancel——实测各仓 push→main 的入板刷新被取消 15~18/18 次，
+  # 大盘刷新只能靠 tag 推送或每小时整点全量补跑兜底。
+  # 拆成三类后：push 仍按 refs/heads/main 收敛（连续推送只跑最新一次），
+  # issues / pull_request 按条目号隔离（并发开多个 issue 不会互相顶掉）。
+  group: issue-to-project-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  link:
+    runs-on: ubuntu-latest
+    steps:
+      # 脚本在治理仓，这里借检出拿权威版本
+      - uses: actions/checkout@v7
+        with:
+          repository: oekit/.github
+          ref: main
+
+      - name: Link issue/PR to org boards
+        if: github.event_name == 'issues' || github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.OEKIT_PROJECT_TOKEN }}
+          ORG: oekit
+          URL: ${{ github.event.issue.html_url || github.event.pull_request.html_url }}
+          STATE: ${{ github.event.pull_request.merged && 'merged' || github.event.issue.state || github.event.pull_request.state }}
+        run: |
+          set -e
+          echo "link $URL state=$STATE"
+          python3 scripts/sync-projects.py --link "$URL" --state "$STATE"
+
+      - name: Refresh version & health boards
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.OEKIT_PROJECT_TOKEN }}
+          ORG: oekit
+          MODULE: ${{ github.event.repository.name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -e
+          echo "refresh module=$MODULE ref=$REF"
+          python3 scripts/sync-projects.py --refresh-module "$MODULE"
