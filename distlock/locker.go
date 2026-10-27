@@ -91,7 +91,13 @@ func WithOnLock(fn func(key string, acquired bool, err error)) EtcdLockerOptionF
 }
 
 // NewEtcdLocker 创建 etcd 分布式锁。
-func NewEtcdLocker(cli *clientv3.Client, opts ...EtcdLockerOptionFunc) *EtcdLocker {
+//
+// client 为 nil 时返回 ErrNilClient（构造期 fail-fast，避免首次加锁时在
+// cli.Get 上空指针崩溃）。
+func NewEtcdLocker(cli *clientv3.Client, opts ...EtcdLockerOptionFunc) (*EtcdLocker, error) {
+	if cli == nil {
+		return nil, ErrNilClient
+	}
 	o := &EtcdLockerOption{Prefix: defaultPrefix}
 	for _, fn := range opts {
 		if fn != nil {
@@ -108,7 +114,7 @@ func NewEtcdLocker(cli *clientv3.Client, opts ...EtcdLockerOptionFunc) *EtcdLock
 		gracefulDegradation: o.GracefulDegradation,
 		onLock:              o.OnLock,
 		held:                make(map[string]*heldLock),
-	}
+	}, nil
 }
 
 // TryLock 非阻塞尝试获取锁：新建 Session（租约 ttl + 自动续约）后 Mutex.TryLock。

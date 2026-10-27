@@ -23,8 +23,14 @@ type Subscriber struct {
 var _ regcore.Subscriber = (*Subscriber)(nil)
 
 // NewSubscriber 创建 etcd 订阅器。
-func NewSubscriber(cli *clientv3.Client, opts ...OptionFunc) *Subscriber {
-	return &Subscriber{cli: cli, opt: applyOptions(opts), subs: make(map[string]context.CancelFunc)}
+//
+// client 为 nil 时返回 ErrNilClient（构造期 fail-fast，避免首次订阅时在
+// cli.Get 上空指针崩溃）。
+func NewSubscriber(cli *clientv3.Client, opts ...OptionFunc) (*Subscriber, error) {
+	if cli == nil {
+		return nil, ErrNilClient
+	}
+	return &Subscriber{cli: cli, opt: applyOptions(opts), subs: make(map[string]context.CancelFunc)}, nil
 }
 
 // Subscribe 订阅服务实例变更：先同步回调一次当前快照，随后后台 Watch 推送。

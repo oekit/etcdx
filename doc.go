@@ -13,13 +13,19 @@
 //
 // 注册发现（SPI 对接 nns/registry 链路）：
 //
-//	reg := registry.NewRegistrar(client.Client(), registry.WithPrefix("/myapp"))
+//	reg, err := registry.NewRegistrar(client.Client(), registry.WithPrefix("/myapp"))
+//	if err != nil {
+//	    return err
+//	}
 //	_ = reg.Register(ctx, regcore.Instance{Service: "user", IP: "10.0.0.1", Port: 8080})
 //
 // 分布式锁：
 //
-//	locker := distlock.NewEtcdLocker(client.Client(), distlock.WithPrefix("myapp"))
-//	err := distlock.WithLock(ctx, locker, "deploy:myapp", 30*time.Second, 10*time.Second, func() error {
+//	locker, err := distlock.NewEtcdLocker(client.Client(), distlock.WithPrefix("myapp"))
+//	if err != nil {
+//	    return err
+//	}
+//	err = distlock.WithLock(ctx, locker, "deploy:myapp", 30*time.Second, 10*time.Second, func() error {
 //	    return doDeploy()
 //	})
 package etcdx

@@ -22,11 +22,17 @@
 //	    "github.com/oekit/etcdx/registry"
 //	)
 //
-//	reg := registry.NewRegistrar(cli, registry.WithPrefix("/myapp"), registry.WithTTL(15*time.Second))
+//	reg, err := registry.NewRegistrar(cli, registry.WithPrefix("/myapp"), registry.WithTTL(15*time.Second))
+//	if err != nil {
+//	    return err
+//	}
 //	_ = reg.Register(ctx, regcore.Instance{Service: "user", IP: "10.0.0.1", Port: 8080})
 //	defer reg.Close(ctx)
 //
-//	disc := registry.NewDiscoverer(cli, registry.WithPrefix("/myapp"))
+//	disc, err := registry.NewDiscoverer(cli, registry.WithPrefix("/myapp"))
+//	if err != nil {
+//	    return err
+//	}
 //	insts, _ := disc.Discover(ctx, "user")
 //
 // 与 SPI 同名包 co-import 时请为本包起别名（如 etcdreg）。
