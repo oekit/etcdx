@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
@@ -50,6 +51,8 @@ type EtcdLocker struct {
 	prefix              string
 	gracefulDegradation bool
 	onLock              func(key string, acquired bool, err error)
+	// maxHold 是单次持有的最大持锁时长安全网上限（负值 = 不限制）。
+	maxHold time.Duration
 
 	mu sync.Mutex
 	// held 记录本进程持有的锁：业务 key → ownerID → 持有状态。
@@ -66,6 +69,9 @@ type heldLock struct {
 	ownerID string
 	session *concurrency.Session // 降级放行时为 nil
 	mutex   *concurrency.Mutex
+	// stopSafety 停掉本次持有的「最大持锁时长」安全网 goroutine
+	// （Unlock / Close 时调用；安全网自行触发后由它自己结束）。
+	stopSafety func()
 }
 
 var _ Locker = (*EtcdLocker)(nil)
@@ -75,6 +81,9 @@ type EtcdLockerOption struct {
 	Prefix              string
 	GracefulDegradation bool
 	OnLock              func(key string, acquired bool, err error)
+	// MaxHold 是单次持有的**最大持锁时长**（安全网，0 = 用默认 10×ttl，
+	// 负值 = 不限制）。
+	MaxHold time.Duration
 }
 
 // EtcdLockerOptionFunc 配置函数类型。
@@ -95,6 +104,23 @@ func WithGracefulDegradation() EtcdLockerOptionFunc {
 // WithOnLock 设置加锁结果回调（指标/日志钩子），在 TryLock/Lock 返回前同步调用。
 func WithOnLock(fn func(key string, acquired bool, err error)) EtcdLockerOptionFunc {
 	return func(o *EtcdLockerOption) { o.OnLock = fn }
+}
+
+// WithMaxHold 设置单次持有的**最大持锁时长**（安全网，#36）。
+//
+// 与 redisx/distlock 的 `WithMaxAutoRenew` **对称**：忘记 Unlock 时，
+// 到期后安全网会**停止续租**，锁在 TTL 后自然过期 ⇒ 不会形成
+// 「永久持锁 + keepalive goroutine 泄漏」。
+//
+//   - 0（默认）：10×ttl；
+//   - 负值：不限制（兼容旧行为，需调用方保证 Unlock 一定被调用）；
+//   - 正值：显式上限。
+//
+// 实现用的是 etcd `Session.Orphan()`：它**停止 keepalive 但不撤销租约**
+// ⇒ 租约在 TTL 后自然过期、键随之删除 ⇒ 语义与 redisx 侧
+// 「续期到期后锁在 TTL 后自然过期」一致（不是立刻释放）。
+func WithMaxHold(d time.Duration) EtcdLockerOptionFunc {
+	return func(o *EtcdLockerOption) { o.MaxHold = d }
 }
 
 // NewEtcdLocker 创建 etcd 分布式锁。
@@ -120,6 +146,7 @@ func NewEtcdLocker(cli *clientv3.Client, opts ...EtcdLockerOptionFunc) (*EtcdLoc
 		prefix:              prefix,
 		gracefulDegradation: o.GracefulDegradation,
 		onLock:              o.OnLock,
+		maxHold:             o.MaxHold,
 		held:                make(map[string]map[string]*heldLock),
 	}, nil
 }
@@ -168,6 +195,10 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	if perr != nil {
 		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: etcd unreachable: %w", perr))
 	}
+	// 租约精度：etcd 的租约以**秒**为单位 ⇒ 亚秒 TTL 静默抬成 1s。
+	// （redisx 侧走 SetNX 是精确毫秒 ⇒ 同一个 Locker 接口，200ms 的锁在
+	// redisx 是 200ms、在 etcd 是 1s。这是租约机制的精度限制，不是 bug，
+	// 但调用方按毫秒理解会误判。）
 	ttlSec := int(ttl / time.Second)
 	if ttlSec < 1 {
 		ttlSec = 1
@@ -186,11 +217,55 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: lock %s: %w", key, err))
 	}
 	ownerID := newOwnerID()
+	h := &heldLock{ownerID: ownerID, session: session, mutex: m}
+	h.stopSafety = l.startSafetyNet(key, ownerID, session, ttl)
 	l.mu.Lock()
-	l.setHeld(key, ownerID, &heldLock{ownerID: ownerID, session: session, mutex: m})
+	l.setHeld(key, ownerID, h)
 	l.mu.Unlock()
 	l.notify(key, true, nil)
 	return ownerID, nil
+}
+
+// startSafetyNet 启动「最大持锁时长」安全网：到期后**停止续租**
+// （session.Orphan）⇒ 租约在 TTL 后自然过期、键随之删除 ⇒
+// 锁不会因为调用方漏调 Unlock 而被永久持有。
+//
+// 与 redisx/distlock 的 WithMaxAutoRenew 对称（#36）：那边是「续期 goroutine
+// 到期后退出，锁在 TTL 后自然过期」，这边是「keepalive 到期后停止，租约在
+// TTL 后自然过期」——语义一致（都不是立刻释放）。
+//
+// 安全网自身触发后不请求关机：持锁进程可能仍在跑临界区，锁被自然过期后
+// 另一个实例可以拿到锁——这正是「安全网兜底」想要的语义（对比 redisx 侧：
+// 锁自然过期后同样会被别的实例拿到）。
+//
+// stop 返回的函数用于在 Unlock / Close 时提前终止安全网（此时锁是正常释放的，
+// 不该等到期）。
+func (l *EtcdLocker) startSafetyNet(key, ownerID string, session *concurrency.Session, ttl time.Duration) func() {
+	maxHold := l.maxHold
+	switch {
+	case maxHold < 0:
+		return nil // 不限制：完全依赖调用方 Unlock
+	case maxHold == 0:
+		maxHold = 10 * ttl
+		if maxHold <= 0 {
+			maxHold = 10 * time.Second
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	async.GoSafe(func() {
+		timer := time.NewTimer(maxHold)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return // 正常 Unlock / Close 提前终止
+		case <-timer.C:
+		}
+		// 到期：停止续租（不撤销租约）⇒ 租约在 TTL 后自然过期。
+		log.Warn("etcdx distlock max hold exceeded, stopping lease renewal",
+			"key", key, "owner", ownerID, "max_hold", maxHold)
+		session.Orphan()
+	})
+	return cancel
 }
 
 // setHeld 记录一次持有（同 key 多 ownerID 各占一条，互不覆盖）。
@@ -239,6 +314,9 @@ func (l *EtcdLocker) Close(ctx context.Context) error {
 }
 
 func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error {
+	if h.stopSafety != nil {
+		h.stopSafety() // 正常释放路径：停掉安全网，不让它随后再动租约
+	}
 	if h.session == nil { // 降级放行的锁无需释放
 		return nil
 	}
