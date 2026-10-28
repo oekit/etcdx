@@ -2,6 +2,10 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.2.0] — 2026-10-28
+
+- **BREAKING**: fix(etcdx): 构造器不校验 nil client ⇒ 「构造时忘了传 client」被推迟到**第一次实际访问**才爆（`cli.Get`/`cli.Put` 上的空指针崩溃，堆栈里只有 etcd 内部帧，看不出根因，往往是生产环境第一次注册服务时）。`registry` 的四个构造器（`NewRegistrar`/`NewDiscoverer`/`NewSubscriber`/`NewConfigStore`）与 `distlock.NewEtcdLocker` 改为返回 `(*T, error)`，client 为 nil 时返回新增的 `ErrNilClient`——与同 org 的 `registry/nacosimpl` 同口径（构造期 fail-fast）。**下游怎么改**：调用点按 `reg, err := registry.NewRegistrar(cli)` 形态处理 err 即可；org 内零消费方
+
 ## [v0.1.7] — 2026-10-23
 
 - build: 矩阵内依赖地板对齐（align_floors 不动点）：concurrency v0.17.0 → v0.20.2、logx v0.7.0 → v0.7.1、registry v0.4.1 → v0.5.0（#23）
