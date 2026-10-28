@@ -51,8 +51,15 @@ type EtcdLocker struct {
 	gracefulDegradation bool
 	onLock              func(key string, acquired bool, err error)
 
-	mu   sync.Mutex
-	held map[string]*heldLock // 业务 key → 本进程持有状态
+	mu sync.Mutex
+	// held 记录本进程持有的锁：业务 key → ownerID → 持有状态。
+	//
+	// **按 ownerID 分层**（而不是 key → 条目）：同一个 key 可能在本进程里出现
+	// 多个持有者（降级放行与真实持锁并存、或上层对同一 key 重复加锁）。单层
+	// 映射会让后写者**静默覆盖**前一个 ⇒ 前一个的 Session 永远不被关闭
+	// （租约继续续期 ⇒ 锁不释放），且前一个 owner 的 Unlock 因 ownerID 不匹配
+	// 报 ErrNotOwner ⇒ 它的锁也放不掉。
+	held map[string]map[string]*heldLock
 }
 
 type heldLock struct {
@@ -113,7 +120,7 @@ func NewEtcdLocker(cli *clientv3.Client, opts ...EtcdLockerOptionFunc) (*EtcdLoc
 		prefix:              prefix,
 		gracefulDegradation: o.GracefulDegradation,
 		onLock:              o.OnLock,
-		held:                make(map[string]*heldLock),
+		held:                make(map[string]map[string]*heldLock),
 	}, nil
 }
 
@@ -180,21 +187,36 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	}
 	ownerID := newOwnerID()
 	l.mu.Lock()
-	l.held[key] = &heldLock{ownerID: ownerID, session: session, mutex: m}
+	l.setHeld(key, ownerID, &heldLock{ownerID: ownerID, session: session, mutex: m})
 	l.mu.Unlock()
 	l.notify(key, true, nil)
 	return ownerID, nil
 }
 
+// setHeld 记录一次持有（同 key 多 ownerID 各占一条，互不覆盖）。
+// 调用方需持有 l.mu。
+func (l *EtcdLocker) setHeld(key, ownerID string, h *heldLock) {
+	if l.held == nil {
+		l.held = make(map[string]map[string]*heldLock)
+	}
+	if l.held[key] == nil {
+		l.held[key] = make(map[string]*heldLock)
+	}
+	l.held[key][ownerID] = h
+}
+
 // Unlock 释放锁：ownerID 须与本进程持有记录一致；释放后 Session 关闭回收租约。
 func (l *EtcdLocker) Unlock(ctx context.Context, key, ownerID string) error {
 	l.mu.Lock()
-	h := l.held[key]
-	if h == nil || h.ownerID != ownerID {
+	h := l.held[key][ownerID]
+	if h == nil {
 		l.mu.Unlock()
 		return ErrNotOwner
 	}
-	delete(l.held, key)
+	delete(l.held[key], ownerID)
+	if len(l.held[key]) == 0 {
+		delete(l.held, key)
+	}
 	l.mu.Unlock()
 	return l.release(ctx, key, h)
 }
@@ -203,12 +225,14 @@ func (l *EtcdLocker) Unlock(ctx context.Context, key, ownerID string) error {
 func (l *EtcdLocker) Close(ctx context.Context) error {
 	l.mu.Lock()
 	held := l.held
-	l.held = make(map[string]*heldLock)
+	l.held = make(map[string]map[string]*heldLock)
 	l.mu.Unlock()
 	var errs []error
-	for key, h := range held {
-		if err := l.release(ctx, key, h); err != nil {
-			errs = append(errs, err)
+	for key, byOwner := range held {
+		for _, h := range byOwner {
+			if err := l.release(ctx, key, h); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -236,7 +260,7 @@ func (l *EtcdLocker) degradeOrFail(key string, err error) (string, error) {
 		log.Warn("etcd unavailable, lock degraded to pass-through", "key", key, "err", err)
 		ownerID := "degraded:" + newOwnerID()
 		l.mu.Lock()
-		l.held[key] = &heldLock{ownerID: ownerID}
+		l.setHeld(key, ownerID, &heldLock{ownerID: ownerID})
 		l.mu.Unlock()
 		l.notify(key, true, nil)
 		return ownerID, nil
