@@ -2,6 +2,20 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.2.2] — 2026-10-28
+
+- feat(distlock): EtcdLocker 补「最大持锁时长」安全网——漏调 Unlock 不再永久持锁
+
+`EtcdLocker` 每次加锁新建一个 etcd Session，Session 的 keepalive 会**无限续租**（ctx 只在 `Session.Close/Orphan` 时取消）；而持有记录只在 `Unlock` / `Close` 时清除 ⇒ **调用方漏调 `Unlock`（且进程不退出）⇒ 该锁的租约永不过期 ⇒ 锁被永久持有** ⇒ 集群里其它实例每次都 `ErrLockTimeout`，该业务功能**彻底不可用且不可自愈**（进程重启前不会恢复），同时每次加锁泄漏一个 keepalive goroutine 和一条租约。
+
+这正是 `redisx/distlock` 侧已用 `WithMaxAutoRenew` 显式防掉的那一类事故（那边明写：「忘记 Unlock 时，续期 goroutine 到期后自行退出，锁在 TTL 后自然过期，不会形成永久持锁 + goroutine 泄漏」），而 `etcdx` 的 `Locker` 接口自述「与 redisx/distlock.Locker 同形」却**完全没有等价的安全网**。
+
+修法：新增 `WithMaxHold(d)`（0 = 默认 10×ttl；负值 = 不限制；正值 = 显式上限），到期时的动作用 etcd **`Session.Orphan()`**——它**停止 keepalive 但不撤销租约** ⇒ 租约在 TTL 后自然过期、键随之删除 ⇒ 语义与 redisx 侧「续期到期后锁在 TTL 后自然过期」**一致**（不是立刻释放）。`Unlock` / `Close` 走 `release()` 时停掉该安全网 goroutine（正常释放不该等到期）。
+
+另补注释：etcd 租约以**秒**为单位，亚秒 TTL 会被静默抬成 1s（redisx 侧 `SetNX` 是精确毫秒）⇒ 同一个 `Locker` 接口，200ms 的锁在 redisx 是 200ms、在 etcd 是 1s——这是租约机制的精度限制，不是 bug，但调用方按毫秒理解会误判。
+
+补 3 条用例（跑在仓内自带嵌入式 etcd 上）：**故意不 Unlock** ⇒ 安全网到期后另一个实例能拿到锁；正常 Unlock 后另一个实例立刻能拿到；`WithMaxHold(-1)` 不启动安全网（#36）
+
 ## [v0.2.1] — 2026-10-28
 
 - fix(distlock): 本进程持有状态改为「key → ownerID → 条目」两层映射——此前单层映射下，同一 key 的多个持有者（降级放行与真实持锁并存、或上层重复加锁）后写者静默覆盖前一个 ⇒ 前一个的 Session 永不关闭（租约继续续期 ⇒ 锁不释放），且其 Unlock 因 ownerID 不匹配报 ErrNotOwner ⇒ 它的锁也放不掉
