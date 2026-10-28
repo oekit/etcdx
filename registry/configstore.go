@@ -23,8 +23,14 @@ type ConfigStore struct {
 var _ regcore.ConfigStore = (*ConfigStore)(nil)
 
 // NewConfigStore 创建 etcd 配置源。
-func NewConfigStore(cli *clientv3.Client, opts ...OptionFunc) *ConfigStore {
-	return &ConfigStore{cli: cli, opt: applyOptions(opts), listeners: make(map[string]context.CancelFunc)}
+//
+// client 为 nil 时返回 ErrNilClient（构造期 fail-fast，避免首次读写时在
+// cli.Get/cli.Put 上空指针崩溃）。
+func NewConfigStore(cli *clientv3.Client, opts ...OptionFunc) (*ConfigStore, error) {
+	if cli == nil {
+		return nil, ErrNilClient
+	}
+	return &ConfigStore{cli: cli, opt: applyOptions(opts), listeners: make(map[string]context.CancelFunc)}, nil
 }
 
 // PutConfig 写入配置（SPI 之外的便捷方法：供运维脚本/测试灌配置）。

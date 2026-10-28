@@ -14,8 +14,14 @@ import (
 func TestTryLockAndUnlock(t *testing.T) {
 	cli := testutil.NewClient(t)
 	ctx := context.Background()
-	l1 := NewEtcdLocker(cli, WithPrefix("t"))
-	l2 := NewEtcdLocker(cli, WithPrefix("t"))
+	l1, err := NewEtcdLocker(cli, WithPrefix("t"))
+	if err != nil {
+		t.Fatalf("NewEtcdLocker: %v", err)
+	}
+	l2, err := NewEtcdLocker(cli, WithPrefix("t"))
+	if err != nil {
+		t.Fatalf("NewEtcdLocker: %v", err)
+	}
 
 	owner, err := l1.TryLock(ctx, "job", 5*time.Second)
 	if err != nil || owner == "" {
@@ -48,8 +54,14 @@ func TestTryLockAndUnlock(t *testing.T) {
 func TestLockTimeoutAndHandoff(t *testing.T) {
 	cli := testutil.NewClient(t)
 	ctx := context.Background()
-	l1 := NewEtcdLocker(cli)
-	l2 := NewEtcdLocker(cli)
+	l1, err := NewEtcdLocker(cli)
+	if err != nil {
+		t.Fatalf("NewEtcdLocker: %v", err)
+	}
+	l2, err := NewEtcdLocker(cli)
+	if err != nil {
+		t.Fatalf("NewEtcdLocker: %v", err)
+	}
 
 	owner, err := l1.Lock(ctx, "res", 5*time.Second, time.Second)
 	if err != nil {
@@ -77,14 +89,20 @@ func TestLockTimeoutAndHandoff(t *testing.T) {
 
 func TestLockRespectsCallerContext(t *testing.T) {
 	cli := testutil.NewClient(t)
-	l1 := NewEtcdLocker(cli)
-	l2 := NewEtcdLocker(cli)
+	l1, err := NewEtcdLocker(cli)
+	if err != nil {
+		t.Fatalf("NewEtcdLocker: %v", err)
+	}
+	l2, err := NewEtcdLocker(cli)
+	if err != nil {
+		t.Fatalf("NewEtcdLocker: %v", err)
+	}
 	owner, _ := l1.TryLock(context.Background(), "ctx", 5*time.Second)
 	defer l1.Unlock(context.Background(), "ctx", owner) //nolint:errcheck
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
-	_, err := l2.Lock(ctx, "ctx", 5*time.Second, 10*time.Second)
+	_, err = l2.Lock(ctx, "ctx", 5*time.Second, 10*time.Second)
 	if err == nil || errors.Is(err, ErrLockTimeout) {
 		t.Fatalf("canceled ctx err = %v; want context error, not ErrLockTimeout", err)
 	}
@@ -93,12 +111,20 @@ func TestLockRespectsCallerContext(t *testing.T) {
 func TestWithLock(t *testing.T) {
 	cli := testutil.NewClient(t)
 	ctx := context.Background()
-	locker := NewEtcdLocker(cli)
+	locker, err := NewEtcdLocker(cli)
+	if err != nil {
+		t.Fatalf("NewEtcdLocker: %v", err)
+	}
 	var calls int
-	err := WithLock(ctx, locker, "wl", 5*time.Second, time.Second, func() error {
+	err = WithLock(ctx, locker, "wl", 5*time.Second, time.Second, func() error {
 		calls++
 		// 持锁期间他人拿不到
-		if _, err := NewEtcdLocker(cli).TryLock(ctx, "wl", 5*time.Second); !errors.Is(err, ErrLockNotAcquired) {
+		other, err := NewEtcdLocker(cli)
+		if err != nil {
+			t.Errorf("NewEtcdLocker: %v", err)
+			return errors.New("biz")
+		}
+		if _, err := other.TryLock(ctx, "wl", 5*time.Second); !errors.Is(err, ErrLockNotAcquired) {
 			t.Errorf("TryLock inside WithLock err = %v; want ErrLockNotAcquired", err)
 		}
 		return errors.New("biz")
@@ -122,15 +148,21 @@ func TestGracefulDegradation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	strict := NewEtcdLocker(cli)
+	strict, err := NewEtcdLocker(cli)
+	if err != nil {
+		t.Fatalf("NewEtcdLocker: %v", err)
+	}
 	if _, err := strict.TryLock(ctx, "k", time.Second); err == nil || errors.Is(err, ErrLockNotAcquired) {
 		t.Fatalf("strict TryLock err = %v; want transport error", err)
 	}
 
 	var notified bool
-	lax := NewEtcdLocker(cli, WithGracefulDegradation(), WithOnLock(func(key string, acquired bool, err error) {
+	lax, err := NewEtcdLocker(cli, WithGracefulDegradation(), WithOnLock(func(key string, acquired bool, err error) {
 		notified = acquired && err == nil
 	}))
+	if err != nil {
+		t.Fatalf("NewEtcdLocker: %v", err)
+	}
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel2()
 	owner, err := lax.TryLock(ctx2, "k", time.Second)

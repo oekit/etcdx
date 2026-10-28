@@ -15,8 +15,11 @@
 //
 // # 快速接入
 //
-//	locker := distlock.NewEtcdLocker(cli, distlock.WithPrefix("myapp"))
-//	err := distlock.WithLock(ctx, locker, "deploy:myapp:dev", 30*time.Second, 10*time.Second, func() error {
+//	locker, err := distlock.NewEtcdLocker(cli, distlock.WithPrefix("myapp"))
+//	if err != nil {
+//	    return err
+//	}
+//	err = distlock.WithLock(ctx, locker, "deploy:myapp:dev", 30*time.Second, 10*time.Second, func() error {
 //	    return doDeploy()
 //	})
 //

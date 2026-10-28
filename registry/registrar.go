@@ -51,8 +51,14 @@ func (r *registration) setLease(id clientv3.LeaseID) {
 var _ regcore.Registrar = (*Registrar)(nil)
 
 // NewRegistrar 创建 etcd 注册器。
-func NewRegistrar(cli *clientv3.Client, opts ...OptionFunc) *Registrar {
-	return &Registrar{cli: cli, opt: applyOptions(opts), regs: make(map[string]*registration)}
+//
+// client 为 nil 时返回 ErrNilClient（构造期 fail-fast，避免首次注册时在
+// cli.Put 上空指针崩溃）。
+func NewRegistrar(cli *clientv3.Client, opts ...OptionFunc) (*Registrar, error) {
+	if cli == nil {
+		return nil, ErrNilClient
+	}
+	return &Registrar{cli: cli, opt: applyOptions(opts), regs: make(map[string]*registration)}, nil
 }
 
 // Register 注册实例：Grant 租约 → Put 带租约的实例键 → 启动监护 goroutine。

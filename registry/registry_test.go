@@ -27,8 +27,14 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 func TestRegisterDiscoverDeregister(t *testing.T) {
 	cli := testutil.NewClient(t)
 	ctx := context.Background()
-	reg := NewRegistrar(cli, WithPrefix("/t"), WithTTL(5*time.Second))
-	disc := NewDiscoverer(cli, WithPrefix("/t"))
+	reg, err := NewRegistrar(cli, WithPrefix("/t"), WithTTL(5*time.Second))
+	if err != nil {
+		t.Fatalf("NewRegistrar: %v", err)
+	}
+	disc, err := NewDiscoverer(cli, WithPrefix("/t"))
+	if err != nil {
+		t.Fatalf("NewDiscoverer: %v", err)
+	}
 
 	if _, err := disc.Discover(ctx, "user"); !errors.Is(err, regcore.ErrNoInstances) {
 		t.Fatalf("empty Discover err = %v; want ErrNoInstances", err)
@@ -90,7 +96,10 @@ func TestRegisterDiscoverDeregister(t *testing.T) {
 
 func TestRegisterValidation(t *testing.T) {
 	cli := testutil.NewClient(t)
-	reg := NewRegistrar(cli)
+	reg, err := NewRegistrar(cli)
+	if err != nil {
+		t.Fatalf("NewRegistrar: %v", err)
+	}
 	ctx := context.Background()
 	for _, inst := range []regcore.Instance{
 		{IP: "1.1.1.1", Port: 80},
@@ -107,12 +116,18 @@ func TestRegisterValidation(t *testing.T) {
 func TestSubscribe(t *testing.T) {
 	cli := testutil.NewClient(t)
 	ctx := context.Background()
-	reg := NewRegistrar(cli, WithPrefix("/t"))
-	sub := NewSubscriber(cli, WithPrefix("/t"))
+	reg, err := NewRegistrar(cli, WithPrefix("/t"))
+	if err != nil {
+		t.Fatalf("NewRegistrar: %v", err)
+	}
+	sub, err := NewSubscriber(cli, WithPrefix("/t"))
+	if err != nil {
+		t.Fatalf("NewSubscriber: %v", err)
+	}
 
 	var mu sync.Mutex
 	var snapshots [][]regcore.Instance
-	err := sub.Subscribe(ctx, "order", func(insts []regcore.Instance) {
+	err = sub.Subscribe(ctx, "order", func(insts []regcore.Instance) {
 		mu.Lock()
 		snapshots = append(snapshots, insts)
 		mu.Unlock()
@@ -168,7 +183,10 @@ func TestSubscribe(t *testing.T) {
 func TestConfigStore(t *testing.T) {
 	cli := testutil.NewClient(t)
 	ctx := context.Background()
-	cs := NewConfigStore(cli, WithPrefix("/t"))
+	cs, err := NewConfigStore(cli, WithPrefix("/t"))
+	if err != nil {
+		t.Fatalf("NewConfigStore: %v", err)
+	}
 
 	v, err := cs.GetConfig(ctx, "app.json", "")
 	if err != nil || v != "" {

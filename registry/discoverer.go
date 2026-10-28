@@ -18,8 +18,14 @@ type Discoverer struct {
 var _ regcore.Discoverer = (*Discoverer)(nil)
 
 // NewDiscoverer 创建 etcd 发现器。
-func NewDiscoverer(cli *clientv3.Client, opts ...OptionFunc) *Discoverer {
-	return &Discoverer{cli: cli, opt: applyOptions(opts)}
+//
+// client 为 nil 时返回 ErrNilClient（构造期 fail-fast，避免首次发现时在
+// cli.Get 上空指针崩溃）。
+func NewDiscoverer(cli *clientv3.Client, opts ...OptionFunc) (*Discoverer, error) {
+	if cli == nil {
+		return nil, ErrNilClient
+	}
+	return &Discoverer{cli: cli, opt: applyOptions(opts)}, nil
 }
 
 // Discover 返回服务当前存活实例（按地址排序，结果确定）；无实例返回
