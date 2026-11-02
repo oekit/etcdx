@@ -4,8 +4,8 @@ go 1.26.0
 
 require (
 	github.com/oekit/concurrency v0.23.3
-	github.com/oekit/logx v0.8.1
-	github.com/oekit/registry v0.5.2
+	github.com/oekit/logx v0.8.2
+	github.com/oekit/registry v0.5.3
 	go.etcd.io/etcd/api/v3 v3.7.3
 	go.etcd.io/etcd/client/v3 v3.7.3
 	go.etcd.io/etcd/server/v3 v3.7.3
