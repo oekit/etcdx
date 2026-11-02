@@ -2,6 +2,10 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.2.3] — 2026-11-02
+
+- build: 矩阵内依赖地板 `concurrency` v0.23.2 → v0.23.3（维护轮全量对齐；本版不含 API 变更）
+
 ## [v0.2.2] — 2026-10-28
 
 - feat(distlock): EtcdLocker 补「最大持锁时长」安全网——漏调 Unlock 不再永久持锁
