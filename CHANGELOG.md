@@ -8,7 +8,7 @@
 
 ## [v0.2.2] — 2026-10-28
 
-- #36：feat(distlock): EtcdLocker 补「最大持锁时长」安全网——漏调 Unlock 不再永久持锁
+- feat(distlock): EtcdLocker 补「最大持锁时长」安全网（#36）——漏调 Unlock 不再永久持锁
 
 `EtcdLocker` 每次加锁新建一个 etcd Session，Session 的 keepalive 会**无限续租**（ctx 只在 `Session.Close/Orphan` 时取消）；而持有记录只在 `Unlock` / `Close` 时清除 ⇒ **调用方漏调 `Unlock`（且进程不退出）⇒ 该锁的租约永不过期 ⇒ 锁被永久持有** ⇒ 集群里其它实例每次都 `ErrLockTimeout`，该业务功能**彻底不可用且不可自愈**（进程重启前不会恢复），同时每次加锁泄漏一个 keepalive goroutine 和一条租约。
 
