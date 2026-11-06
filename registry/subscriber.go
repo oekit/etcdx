@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/oekit/concurrency/async"
 	regcore "github.com/oekit/registry"
@@ -63,25 +64,65 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 
 	cb(decodeAll(serviceName, s.opt.Group, resp))
 
+	// 观察循环（#55）：watch 被取消（ErrCompacted——长驻订阅 + auto-compaction
+	// 是生产常态；etcd-server 重启等）或通道关闭后**指数退避重建**（重取快照 +
+	// 新 revision），对齐注册侧「丢约指数退避自动重注册」的对等韧性。此前只打
+	// 一条 Warn 就 return：订阅留在 subs map、Unsubscribe「正常」返回，但此后
+	// 永不回调——服务实例列表/配置推送几天后无声停更，消费方拿过期快照继续跑。
 	async.GoSafe(func() {
-		wch := s.cli.Watch(wctx, dir, clientv3.WithPrefix(), clientv3.WithRev(startRev))
-		for wresp := range wch {
-			if wresp.Canceled {
-				log.Warn("watch canceled", "service", serviceName, "err", wresp.Err())
-				return
-			}
-			if len(wresp.Events) == 0 {
-				continue
-			}
-			insts, err := fetchInstances(wctx, s.cli, s.opt.Prefix, s.opt.Group, serviceName)
-			if err != nil {
-				if wctx.Err() != nil {
-					return
+		const maxBackoff = 30 * time.Second
+		backoff := time.Second
+		rev := startRev
+		for wctx.Err() == nil {
+			wch := s.cli.Watch(wctx, dir, clientv3.WithPrefix(), clientv3.WithRev(rev))
+			canceled := false
+			for wresp := range wch {
+				if wresp.Canceled {
+					// Compacted 时 WithRev(startRev) 会被服务端取消——
+					// clientv3 不自动重建，必须自己重建
+					log.Warn("watch canceled, rebuilding with exponential backoff",
+						"service", serviceName, "err", wresp.Err())
+					canceled = true
+					break
 				}
-				log.Warn("refresh after watch event failed", "service", serviceName, "err", err)
-				continue
+				if len(wresp.Events) == 0 {
+					continue
+				}
+				insts, err := fetchInstances(wctx, s.cli, s.opt.Prefix, s.opt.Group, serviceName)
+				if err != nil {
+					if wctx.Err() != nil {
+						return
+					}
+					log.Warn("refresh after watch event failed", "service", serviceName, "err", err)
+					continue
+				}
+				cb(insts)
 			}
-			cb(insts)
+			if wctx.Err() != nil {
+				return // Unsubscribe/Close：正常退出，不重建
+			}
+			if !canceled && wch != nil {
+				// 通道关闭且未见 Canceled（client 断连等）：同样走重建
+				log.Warn("watch channel closed, rebuilding", "service", serviceName)
+			}
+			// 退避等待（可被取消打断），重取快照拿新 revision，避免重建即 Compacted
+			select {
+			case <-wctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < maxBackoff {
+				backoff *= 2
+			}
+			resp, err := s.cli.Get(wctx, dir, clientv3.WithPrefix())
+			if err != nil {
+				log.Warn("snapshot refresh for watch rebuild failed, retrying",
+					"service", serviceName, "err", err)
+				continue // 快照失败：下轮再试（rev 不变，可能仍 Compacted，会再退避）
+			}
+			rev = resp.Header.Revision + 1
+			// 重建成功前先回调一次快照（期间可能有实例变更，全量刷新一次视图）
+			cb(decodeAll(serviceName, s.opt.Group, resp))
 		}
 	})
 	return nil

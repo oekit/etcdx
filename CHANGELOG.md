@@ -2,6 +2,13 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.2.5] — 2026-11-06
+
+- fix(distlock): `WithGracefulDegradation` 的降级面收紧到「etcd 不可达」（[#54](https://github.com/oekit/etcdx/issues/54)）——此前 acquire 全链路任何错误都进降级放行：连接预检的 3s 窗口继承调用方 ctx，调用方自己的取消/超时也被当成「etcd 不可达」降级放行——etcd 完全健康、仅 caller 预算 1s 时，TryLock 返回 `degraded:` 成功，多实例同时「拿到锁」并发进临界区，互斥直接失效。修法：三个降级入口（预检/NewSession/do）均补 `ctx.Err() != nil ⇒ 显式报错`，降级只对 etcd 传输层不可用放行
+- fix(registry): Subscriber/ConfigStore 的 watch 被取消后指数退避自动重建（[#55](https://github.com/oekit/etcdx/issues/55)）——此前 `wresp.Canceled` 只 Warn 一条就 return：订阅留在 map、Unsubscribe 「正常」返回，但永不再回调——长驻订阅 + auto-compaction（`WithRev(startRev)` 被服务端取消的常态）让实例列表/配置推送几天后无声停更，消费方拿过期快照继续跑。修法：对齐注册侧「丢约指数退避自动重注册」的对等韧性——重建前重读快照拿新 revision（避免重建即 Compacted）+ 立即回调一次当前值，退避上限 30s；Unsubscribe/正常退出不重建
+
+关联问题单：etcdx#54、etcdx#55。
+
 ## [v0.2.4] — 2026-11-06
 
 - build: 矩阵依赖地板对齐（维护轮 #233）

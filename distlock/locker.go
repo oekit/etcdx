@@ -193,6 +193,14 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	_, perr := l.cli.Get(pctx, l.prefix)
 	pcancel()
 	if perr != nil {
+		// #54：调用方 ctx 自身取消/超时 ≠ etcd 不可达——降级面只对
+		// 「etcd 传输层不可用」放行，caller ctx 问题显式报错。此前把 caller
+		// deadline 误标为 etcd unreachable 后降级放行：多实例同时「拿到锁」
+		// 并发进临界区，互斥直接失效。
+		if ctx.Err() != nil {
+			l.notify(key, false, ctx.Err())
+			return "", fmt.Errorf("etcdx distlock: caller context done while probing etcd: %w", ctx.Err())
+		}
 		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: etcd unreachable: %w", perr))
 	}
 	// 租约精度：etcd 的租约以**秒**为单位 ⇒ 亚秒 TTL 静默抬成 1s。
@@ -205,6 +213,9 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	}
 	session, err := concurrency.NewSession(l.cli, concurrency.WithTTL(ttlSec))
 	if err != nil {
+		if ctx.Err() != nil { // #54：caller ctx 问题显式报错
+			return "", fmt.Errorf("etcdx distlock: new session: %w", err)
+		}
 		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: new session: %w", err))
 	}
 	m := concurrency.NewMutex(session, l.lockKey(key))
@@ -213,6 +224,10 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 		if errors.Is(err, ErrLockNotAcquired) || errors.Is(err, ErrLockTimeout) || ctx.Err() != nil {
 			l.notify(key, false, err)
 			return "", err
+		}
+		// #54 同口径：caller ctx 已取消/超时的错误不进降级面
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("etcdx distlock: lock %s: %w", key, err)
 		}
 		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: lock %s: %w", key, err))
 	}

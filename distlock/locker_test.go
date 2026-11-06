@@ -1,6 +1,7 @@
 package distlock
 
 import (
+	"strings"
 	"context"
 	"errors"
 	"testing"
@@ -163,7 +164,9 @@ func TestGracefulDegradation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEtcdLocker: %v", err)
 	}
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	// caller ctx 需 > probe 3s 窗口：probe 对不可达 etcd 要等满窗口才失败，
+	// caller deadline 更短会被 #54 的新判定显式报错（见下一条测试）
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel2()
 	owner, err := lax.TryLock(ctx2, "k", time.Second)
 	if err != nil || owner == "" || !notified {
@@ -171,5 +174,32 @@ func TestGracefulDegradation(t *testing.T) {
 	}
 	if err := lax.Unlock(ctx2, "k", owner); err != nil {
 		t.Fatalf("degraded Unlock: %v", err)
+	}
+}
+
+// TestGracefulDegradation_CallerCtxDone_ExplicitError 钉住 #54：调用方 ctx
+// 自身取消/超时 ≠ etcd 不可达——即便开启 WithGracefulDegradation 也必须
+// 显式报错，不得降级放行（多实例同时「拿到锁」并发进临界区 = 互斥失效）。
+func TestGracefulDegradation_CallerCtxDone_ExplicitError(t *testing.T) {
+	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{"127.0.0.1:1"}, DialTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("clientv3.New: %v", err)
+	}
+	defer func() { _ = cli.Close() }()
+	lax, err := NewEtcdLocker(cli, WithGracefulDegradation())
+	if err != nil {
+		t.Fatalf("NewEtcdLocker: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	owner, err := lax.TryLock(ctx, "k", time.Second)
+	if err == nil {
+		t.Fatalf("caller ctx 超时不得降级放行, got owner=%q", owner)
+	}
+	if strings.HasPrefix(owner, "degraded:") {
+		t.Fatalf("不得返回 degraded owner, got %q", owner)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err 应携带 caller ctx 错误, got %v", err)
 	}
 }
