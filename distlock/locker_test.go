@@ -1,9 +1,9 @@
 package distlock
 
 import (
-	"strings"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
