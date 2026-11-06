@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/oekit/concurrency/async"
 	regcore "github.com/oekit/registry"
@@ -88,18 +89,54 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 	c.mu.Unlock()
 
 	async.GoSafe(func() {
-		wch := c.cli.Watch(wctx, key, clientv3.WithRev(startRev))
-		for wresp := range wch {
-			if wresp.Canceled {
-				log.Warn("config watch canceled", "dataID", dataID, "err", wresp.Err())
-				return
-			}
-			for _, ev := range wresp.Events {
-				if ev.Type == clientv3.EventTypeDelete {
-					onChange("")
-				} else {
-					onChange(string(ev.Kv.Value))
+		// 观察循环（#55）：Canceled（ErrCompacted 等）/通道关闭后指数退避重建
+		//（重读当前值拿新 revision + 立即回调一次最新内容）——对齐订阅侧的
+		// 自动重建韧性；此前只 Warn 一条就 return，配置推送几天后无声停更。
+		const maxBackoff = 30 * time.Second
+		backoff := time.Second
+		rev := startRev
+		for wctx.Err() == nil {
+			wch := c.cli.Watch(wctx, key, clientv3.WithRev(rev))
+			canceled := false
+			for wresp := range wch {
+				if wresp.Canceled {
+					log.Warn("config watch canceled, rebuilding with exponential backoff",
+						"dataID", dataID, "err", wresp.Err())
+					canceled = true
+					break
 				}
+				for _, ev := range wresp.Events {
+					if ev.Type == clientv3.EventTypeDelete {
+						onChange("")
+					} else {
+						onChange(string(ev.Kv.Value))
+					}
+				}
+			}
+			if wctx.Err() != nil {
+				return // StopListenConfig：正常退出
+			}
+			if !canceled {
+				log.Warn("config watch channel closed, rebuilding", "dataID", dataID)
+			}
+			select {
+			case <-wctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < maxBackoff {
+				backoff *= 2
+			}
+			resp, err := c.cli.Get(wctx, key, clientv3.WithKeysOnly())
+			if err != nil {
+				log.Warn("config snapshot refresh for rebuild failed, retrying",
+					"dataID", dataID, "err", err)
+				continue
+			}
+			rev = resp.Header.Revision + 1
+			// 重建后立即回调一次当前值（重建窗口内的变更不丢视图）
+			if val, err := c.cli.Get(wctx, key); err == nil && len(val.Kvs) > 0 {
+				onChange(string(val.Kvs[0].Value))
 			}
 		}
 	})
