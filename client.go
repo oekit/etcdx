@@ -24,6 +24,10 @@ type Client struct {
 // 生产默认值（调用方显式设置的字段不覆盖）：DialTimeout 5s 收紧故障感知
 // 窗口；AutoSyncInterval/MaxCallSendMsgSize 等其余字段交给 etcd 默认值。
 // Endpoints 为空显式报错（静默连本地 2379 是事故源）。
+//
+// **不改写调用方传入的 Config**（#65）：零值默认在浅拷贝 `cfg := *opt` 上
+// 应用——调用方复用同一结构体建多个客户端、或序列化记录配置时，不会发现
+// 字段被悄悄改掉（0 → 5s）。此前直接写入调用方的结构体，属未声明的副作用。
 func NewClient(opt *clientv3.Config) (*Client, error) {
 	if opt == nil {
 		return nil, fmt.Errorf("etcdx: config is nil")
@@ -31,10 +35,11 @@ func NewClient(opt *clientv3.Config) (*Client, error) {
 	if len(opt.Endpoints) == 0 {
 		return nil, fmt.Errorf("etcdx: endpoints is empty")
 	}
-	if opt.DialTimeout == 0 {
-		opt.DialTimeout = 5 * time.Second
+	cfg := *opt
+	if cfg.DialTimeout == 0 {
+		cfg.DialTimeout = 5 * time.Second
 	}
-	c, err := clientv3.New(*opt)
+	c, err := clientv3.New(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("etcdx: new client: %w", err)
 	}
