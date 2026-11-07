@@ -8,6 +8,7 @@ import (
 	"time"
 
 	regcore "github.com/oekit/registry"
+	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/oekit/etcdx/internal/testutil"
 )
@@ -111,6 +112,66 @@ func TestRegisterValidation(t *testing.T) {
 			t.Fatalf("Register(%+v) should fail", inst)
 		}
 	}
+}
+
+// TestConcurrentRegisterSameKeyNoOrphanLease 钉住 #67：同 key 并发 Register
+// 只能留下**一条**活动租约（后到者整体替换先到者），Close 后归零。旧实现的
+// Register「锁内摘旧 → 放锁做 Grant+Put → 回锁写入」三段式，并发时都读到
+// old=nil ⇒ 各自留下一条 registration、map 只留后写者——先写者的 supervise
+// goroutine 永远 KeepAlive 一条无人引用的孤儿租约（不释放、Close 也收不到）。
+func TestConcurrentRegisterSameKeyNoOrphanLease(t *testing.T) {
+	cli := testutil.NewClient(t)
+	ctx := context.Background()
+	reg, err := NewRegistrar(cli, WithPrefix("/t"), WithTTL(5*time.Second))
+	if err != nil {
+		t.Fatalf("NewRegistrar: %v", err)
+	}
+
+	inst := regcore.Instance{Service: "user", IP: "10.0.0.1", Port: 8080}
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := reg.Register(ctx, inst); err != nil {
+				t.Errorf("Register: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 收敛断言一：全部 Register 返回后，恰好一条活动租约
+	//（孤儿 supervise 会把数量恒定抬到 >1）
+	if got := countActiveLeases(t, cli); got != 1 {
+		t.Fatalf("active leases after concurrent Register = %d; want 1", got)
+	}
+	// 实例键只有一份（最终胜者的租约持有）
+	disc, err := NewDiscoverer(cli, WithPrefix("/t"))
+	if err != nil {
+		t.Fatalf("NewDiscoverer: %v", err)
+	}
+	insts, err := disc.Discover(ctx, "user")
+	if err != nil || len(insts) != 1 {
+		t.Fatalf("Discover after concurrent Register = %+v, %v; want exactly 1 instance", insts, err)
+	}
+
+	// 收敛断言二：Close 后全部租约回收（孤儿租约无人撤销会恒 ≥1）
+	if err := reg.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return countActiveLeases(t, cli) == 0 })
+}
+
+// countActiveLeases 列出 etcd 当前的活动租约数（#67 测试的观测点：
+// 孤儿 supervise 持续 KeepAlive 的租约会一直出现在列表里）。
+func countActiveLeases(t *testing.T, cli *clientv3.Client) int {
+	t.Helper()
+	resp, err := cli.Leases(context.Background())
+	if err != nil {
+		t.Fatalf("Leases: %v", err)
+	}
+	return len(resp.Leases)
 }
 
 func TestSubscribe(t *testing.T) {

@@ -23,6 +23,15 @@ type Registrar struct {
 	cli *clientv3.Client
 	opt *Option
 
+	// registerMu 串行化 Register 的「替换旧注册」全程（#67）。Register 的
+	// 三段式——锁内摘旧 → 放锁做网络 I/O（Grant+Put）→ 回锁写入——在两个
+	// goroutine 并发注册同一 key 时都读到 old=nil ⇒ 各自留下一条
+	// registration，map 只留后写者：先写者的 supervise goroutine 永远
+	// KeepAlive 一条无人引用的租约（孤儿租约不释放），Close 也收不到它。
+	// 全程串行化后，后到者必然看到并停掉先到者的完整注册。Deregister/Close
+	// 只做 r.mu 下的原子摘除，不受本锁约束、也不会被慢 I/O 卡住。
+	registerMu sync.Mutex
+
 	mu     sync.Mutex
 	regs   map[string]*registration // 实例键 → 监护状态
 	closed bool
@@ -62,7 +71,9 @@ func NewRegistrar(cli *clientv3.Client, opts ...OptionFunc) (*Registrar, error) 
 }
 
 // Register 注册实例：Grant 租约 → Put 带租约的实例键 → 启动监护 goroutine。
-// 同一实例重复 Register 视为刷新（旧监护停止、旧租约撤销后重新注册）。
+// 同一实例重复 Register 视为刷新（旧监护停止、旧租约撤销后重新注册）；
+// 同 key 并发 Register 被串行化（#67，见 registerMu）——后到者整体替换
+// 先到者的注册，先到者的监护 goroutine 与租约必被回收，不会孤儿化。
 // 注册成功返回后，续约与重注册与调用方 ctx 无关，由 Deregister/Close 终止。
 func (r *Registrar) Register(ctx context.Context, inst regcore.Instance) error {
 	if err := validateInstance(inst); err != nil {
@@ -74,6 +85,9 @@ func (r *Registrar) Register(ctx context.Context, inst regcore.Instance) error {
 	if err != nil {
 		return err
 	}
+
+	r.registerMu.Lock()
+	defer r.registerMu.Unlock()
 
 	r.mu.Lock()
 	if r.closed {
