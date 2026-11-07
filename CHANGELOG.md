@@ -2,6 +2,17 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.2.6] — 2026-11-07
+
+- fix(distlock): ttl<=0 前置校验报错、亚秒 TTL 抬 1s 打 Warn——与 redisx「ttl 必须为正」统一口径（#62）
+- fix(distlock): WithGracefulDegradation 收窄为「运行期传输层不可达」放行——业务层错误一律报错，与 redisx 口径交叉声明（#63）
+- test(registry): MVCC 压缩后 watch 重建回归钉——Compaction 后新变更仍被推送（主体修复已随 #55/PR #60 落地）（#64）
+- fix(client): NewClient 浅拷贝 Config——不再原地改写调用方配置（#65）
+- fix(distlock): Lock timeout<=0 语义对齐 redisx——单次非阻塞尝试而非零次（#66）
+- fix(registry): 同 key 并发 Register 串行化——后到者停掉先到者的 supervise+租约，孤儿租约消灭（#67）
+
+关联问题单：etcdx#62、etcdx#63、etcdx#64、etcdx#65、etcdx#66、etcdx#67。
+
 ## [v0.2.5] — 2026-11-06
 
 - fix(distlock): `WithGracefulDegradation` 的降级面收紧到「etcd 不可达」（[#54](https://github.com/oekit/etcdx/issues/54)）——此前 acquire 全链路任何错误都进降级放行：连接预检的 3s 窗口继承调用方 ctx，调用方自己的取消/超时也被当成「etcd 不可达」降级放行——etcd 完全健康、仅 caller 预算 1s 时，TryLock 返回 `degraded:` 成功，多实例同时「拿到锁」并发进临界区，互斥直接失效。修法：三个降级入口（预检/NewSession/do）均补 `ctx.Err() != nil ⇒ 显式报错`，降级只对 etcd 传输层不可用放行
