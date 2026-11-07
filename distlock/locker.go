@@ -6,14 +6,19 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var log = logx.Delegating("etcdx.distlock")
@@ -28,15 +33,33 @@ var ErrLockTimeout = errors.New("lock acquire timeout")
 var ErrNotOwner = errors.New("lock not owned by this owner")
 
 // Locker 是分布式锁接口，与 redisx/distlock.Locker 同形，面向接口编程。
+//
+// 两后端的统一口径（跨后端移植按此理解，调用方换实现不改变行为）：
+//
+//   - ttl 必须为正：ttl≤0 直接报错（与 redisx 的 "ttl must be positive"
+//     对齐，#62）——此前 etcdx 把零值/负值静默抬成 1s，同一份代码换后端
+//     一个立刻报错、一个悄悄持 1s 锁。etcd 租约秒级精度，(0, 1s) 的亚秒
+//     TTL 抬升至 1s 并记 Warn（redisx 毫秒精确，此处是机制差异）。
+//   - Lock 的 timeout≤0 表示**单次非阻塞尝试**（与 redisx 对齐，#66）：
+//     成功或 ErrLockTimeout——redisx 的 Lock 先试一次再看 deadline，故
+//     timeout=0 仍有一次尝试；此前 etcdx 用 WithTimeout(ctx, 0) 造出立即
+//     过期的 ctx，一次都不试就 ErrLockTimeout。
+//   - WithGracefulDegradation 的放行面（#63）：redisx 仅对「构造缺失
+//     （client 为 nil）」放行；etcdx 构造期即拒绝 nil client，不存在该
+//     场景，对应放行面为「运行期 etcd 传输层不可达」。除该面外的一切
+//     错误（权限/认证/参数/压缩/未知业务错）两后端都显式报错，绝不
+//     fail-open。
 type Locker interface {
 	// TryLock 非阻塞尝试获取锁。
 	// 返回 (ownerID, nil) 表示成功，ownerID 用于后续 Unlock。
 	// 返回 ("", ErrLockNotAcquired) 表示锁被占用。
+	// ttl≤0 直接报错（见接口注释统一口径）。
 	TryLock(ctx context.Context, key string, ttl time.Duration) (string, error)
 
 	// Lock 阻塞获取锁，带超时。
 	// 返回 (ownerID, nil) 表示成功。
 	// 返回 ("", ErrLockTimeout) 表示超时未获取到。
+	// timeout≤0 为单次非阻塞尝试（见接口注释统一口径）：成功或 ErrLockTimeout。
 	Lock(ctx context.Context, key string, ttl time.Duration, timeout time.Duration) (string, error)
 
 	// Unlock 释放锁，ownerID 必须匹配。
@@ -94,9 +117,18 @@ func WithPrefix(prefix string) EtcdLockerOptionFunc {
 	return func(o *EtcdLockerOption) { o.Prefix = prefix }
 }
 
-// WithGracefulDegradation 开启无 etcd 时降级放行：etcd 不可达时 TryLock/Lock
-// 直接返回成功（ownerID 带 "degraded:" 前缀）。仅适用于单实例部署等
-// 互斥不关键的场景——多实例下会出现并发执行。
+// WithGracefulDegradation 开启「etcd 传输层不可达」时的降级放行：TryLock/Lock
+// 直接返回成功（ownerID 带 "degraded:" 前缀）。
+//
+// 与 redisx/distlock 的同名选项统一口径（#63）：那边只对「构造缺失
+// （client 为 nil）」放行；本包构造期即拒绝 nil client（ErrNilClient），
+// 不存在该场景，对应放行面就是「运行期 etcd 传输层不可达」（连接拒绝/
+// 断开、gRPC Unavailable、拨号/请求超时）。**其余错误一律显式报错**：
+// 权限/认证/参数/压缩等业务层故障 fail-open 会让多实例在故障窗口内同时
+// 「拿到锁」并发进临界区，互斥静默失效。
+//
+// 即便对「不可达」放行也仅适用于单实例部署等互斥不关键的场景——多实例
+// 下 etcd 重启窗口内各实例会同时降级放行，出现并发执行。
 func WithGracefulDegradation() EtcdLockerOptionFunc {
 	return func(o *EtcdLockerOption) { o.GracefulDegradation = true }
 }
@@ -165,8 +197,22 @@ func (l *EtcdLocker) TryLock(ctx context.Context, key string, ttl time.Duration)
 }
 
 // Lock 阻塞获取锁（revision 公平排队），timeout 内未获得返回 ErrLockTimeout。
+// timeout≤0 为单次非阻塞尝试（与 redisx 对齐，#66）：忙时返回 ErrLockTimeout。
 func (l *EtcdLocker) Lock(ctx context.Context, key string, ttl, timeout time.Duration) (string, error) {
 	return l.acquire(ctx, key, ttl, func(ctx context.Context, m *concurrency.Mutex) error {
+		// timeout≤0：单次非阻塞尝试。redisx 的 Lock 先 TryLock 一次再看
+		// deadline ⇒ timeout=0 仍有一次尝试；此前这里 WithTimeout(ctx, 0)
+		// 造出立即过期的 ctx ⇒ m.Lock 一次都不试就 DeadlineExceeded ⇒
+		// 同接口换后端，redisx 拿得到锁、etcdx 永远拿不到。
+		if timeout <= 0 {
+			if err := m.TryLock(ctx); err != nil {
+				if errors.Is(err, concurrency.ErrLocked) {
+					return ErrLockTimeout // 单次尝试未得 ⇒ 与 redisx 超时口径一致
+				}
+				return err
+			}
+			return nil
+		}
 		tctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		if err := m.Lock(tctx); err != nil {
@@ -186,6 +232,13 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	if key == "" {
 		return "", fmt.Errorf("etcdx distlock: key is empty")
 	}
+	// ttl≤0 与 redisx 对齐直接报错（#62）：同接口下 redisx 的 TryLock 对
+	// ttl≤0 返回 "distlock: ttl must be positive"；此前这里静默抬成 1s——
+	// 同一份调用代码换后端，一个是立刻报错、一个是悄悄持 1s 锁。零值/负值
+	// 是参数错误，在任何网络交互前 fail-fast。
+	if ttl <= 0 {
+		return "", fmt.Errorf("etcdx distlock: ttl must be positive, got %v", ttl)
+	}
 	// 连接预检：NewSession 的 Grant 走 Session 自身的后台 ctx，对不可达
 	// etcd 会无限等待；先用轻量读在有界窗口内探活，失败直接降级/报错，
 	// 不创建注定挂死的 Session
@@ -203,13 +256,15 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 		}
 		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: etcd unreachable: %w", perr))
 	}
-	// 租约精度：etcd 的租约以**秒**为单位 ⇒ 亚秒 TTL 静默抬成 1s。
+	// 租约精度：etcd 的租约以**秒**为单位 ⇒ (0, 1s) 的亚秒 TTL 抬升至 1s。
 	// （redisx 侧走 SetNX 是精确毫秒 ⇒ 同一个 Locker 接口，200ms 的锁在
 	// redisx 是 200ms、在 etcd 是 1s。这是租约机制的精度限制，不是 bug，
-	// 但调用方按毫秒理解会误判。）
+	// 但调用方按毫秒理解会误判 ⇒ 抬升时至少打 Warn 明示（#62），不再静默。）
 	ttlSec := int(ttl / time.Second)
 	if ttlSec < 1 {
 		ttlSec = 1
+		log.Warn("sub-second ttl raised to 1s (etcd lease granularity is seconds)",
+			"key", key, "ttl", ttl)
 	}
 	session, err := concurrency.NewSession(l.cli, concurrency.WithTTL(ttlSec))
 	if err != nil {
@@ -348,9 +403,17 @@ func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error
 	return err
 }
 
+// degradeOrFail 处理加锁链路上的失败：开启 WithGracefulDegradation 且错误
+// 属「etcd 传输层不可达」类（isUnreachable）时降级放行，否则显式报错。
+//
+// #63 收窄：此前这里对**任意**失败（预检失败/NewSession 失败/加锁期任意
+// 非 busy 错误）都放行——权限被拒、认证失效、压缩冲突等业务层故障也会
+// fail-open，多实例在故障窗口内同时「拿到锁」，互斥静默失效。与 redisx
+// （仅构造缺失放行）的语义差被同一选项名掩盖，跨后端移植必踩。现在只有
+// 明确的连接不可达才降级，口径写进 Locker 接口注释。
 func (l *EtcdLocker) degradeOrFail(key string, err error) (string, error) {
-	if l.gracefulDegradation {
-		log.Warn("etcd unavailable, lock degraded to pass-through", "key", key, "err", err)
+	if l.gracefulDegradation && isUnreachable(err) {
+		log.Warn("etcd unreachable, lock degraded to pass-through", "key", key, "err", err)
 		ownerID := "degraded:" + newOwnerID()
 		l.mu.Lock()
 		l.setHeld(key, ownerID, &heldLock{ownerID: ownerID})
@@ -360,6 +423,36 @@ func (l *EtcdLocker) degradeOrFail(key string, err error) (string, error) {
 	}
 	l.notify(key, false, err)
 	return "", err
+}
+
+// isUnreachable 判断 err 是否为「etcd 传输层不可达」类故障：连接拒绝/断开、
+// gRPC Unavailable、拨号/请求超时。只有这类故障进入优雅降级面（见
+// degradeOrFail 的 #63 说明）；权限/认证/参数/压缩等业务层错误不属于——
+// 对它们 fail-open 会静默破坏互斥。
+func isUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	// 探活窗口（pctx 3s）超时 / grpc 把拨号超时映射为 DeadlineExceeded
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// TCP 层连接拒绝/断开（grpc 错误链里包裹的 net 错误）
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	// gRPC 状态码：Unavailable = 连接不可用（断连/无法建连/keepalive 断开）。
+	// 其余码（PermissionDenied/InvalidArgument/OutOfRange(压缩)/…）是业务层
+	// 错误，不降级。status.FromError 内部走 errors.As，支持 %w 包裹链。
+	if st, ok := status.FromError(err); ok {
+		return st.Code() == codes.Unavailable
+	}
+	return false
 }
 
 func (l *EtcdLocker) notify(key string, acquired bool, err error) {
