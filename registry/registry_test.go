@@ -196,13 +196,13 @@ func TestSubscribe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	// 订阅即回调一次空快照
-	mu.Lock()
-	if len(snapshots) != 1 || len(snapshots[0]) != 0 {
-		mu.Unlock()
-		t.Fatalf("initial snapshot = %+v; want one empty", snapshots)
-	}
-	mu.Unlock()
+	// 订阅即回调一次空快照（#84 起首次快照在订阅 goroutine 内投递，与后续
+	// 事件同一条串行路径，不再是 Subscribe 调用里的同步回调）
+	waitFor(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(snapshots) == 1 && len(snapshots[0]) == 0
+	})
 
 	inst := regcore.Instance{Service: "order", IP: "10.0.0.9", Port: 9000}
 	if err := reg.Register(ctx, inst); err != nil {

@@ -1,7 +1,16 @@
-// Package distlock 提供基于 etcd 的分布式锁，接口形态与
+// Package distlock 提供基于 etcd 的分布式锁，方法集与
 // github.com/oekit/redisx/distlock.Locker 完全一致（TryLock/Lock/Unlock +
 // ownerID 语义），Go 结构化类型下两种后端可直接互换，业务代码面向
 // Locker 接口编程即可。
+//
+// # 跨后端错误面（#86）
+//
+// 错误哨兵跨后端 errors.Is 兼容：本包哨兵对**同文案**错误等价判定，
+// errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) 为 true——适配层
+// 绑 redisx 的哨兵跑在 etcdx 上（或反向），「锁被占用」「获取超时」的
+// 错误分类不漂移。Unlock 对非持有者显式报 ErrNotOwner（redisx 侧同样在
+// 其 #115 对齐为显式报错），两侧不再一边静默一边报错。机制级差异（亚秒
+// TTL 精度、降级放行面）见 Locker 接口注释的统一口径。
 //
 // # 实现机制
 //

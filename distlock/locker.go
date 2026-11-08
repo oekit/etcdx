@@ -23,19 +23,50 @@ import (
 
 var log = logx.Delegating("etcdx.distlock")
 
+// sentinel 是本包三个错误哨兵的统一类型（#86）：可比较的值类型，同包内
+// errors.Is 按值身份匹配；同时实现 Is 方法做**同文案等价**判定——redisx/
+// distlock 历史上与本包各自 errors.New 出同名同文案的哨兵，是两个不同的值，
+// 跨包 errors.Is 恒 false，面向 Locker 接口的适配层换后端后错误分类随之
+// 漂移（429 变 500）。本类型让 etcdx 侧哨兵对文案相同的同义哨兵（redisx
+// 侧即普通 errors.New 同文案值）判定为 true：
+// errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) == true，
+// 适配层绑哪一侧的哨兵都能正确分类；与 context.DeadlineExceeded 等无关
+// 错误仍为 false。代价：任何文案完全相同的外部错误也会被判 true——本包
+// 哨兵文案均带锁定语义、无前缀冲突，误判面可忽略。
+type sentinel struct{ msg string }
+
+func (e sentinel) Error() string { return e.msg }
+
+// Is 支持 errors.Is 的 target 判定：同类型按值比较（== 已覆盖），外部
+// 同文案错误（含 redisx/distlock 的同名哨兵）视为同一语义错误（#86）。
+func (e sentinel) Is(target error) bool {
+	if target == nil {
+		return false
+	}
+	return target.Error() == e.msg
+}
+
 // ErrLockNotAcquired 表示锁被其他持有者占用，获取失败。
-var ErrLockNotAcquired = errors.New("lock not acquired")
+var ErrLockNotAcquired = sentinel{msg: "lock not acquired"}
 
 // ErrLockTimeout 表示在指定超时时间内未能获取锁。
-var ErrLockTimeout = errors.New("lock acquire timeout")
+var ErrLockTimeout = sentinel{msg: "lock acquire timeout"}
 
 // ErrNotOwner 表示 Unlock 的 ownerID 与本进程持有记录不符（或该 key 未由本进程持有）。
-var ErrNotOwner = errors.New("lock not owned by this owner")
+var ErrNotOwner = sentinel{msg: "lock not owned by this owner"}
 
-// Locker 是分布式锁接口，与 redisx/distlock.Locker 同形，面向接口编程。
+// Locker 是分布式锁接口，与 redisx/distlock.Locker 方法集同形，面向接口编程。
 //
-// 两后端的统一口径（跨后端移植按此理解，调用方换实现不改变行为）：
+// 两后端的统一口径（跨后端移植按此理解；「方法集同形」之外的行为差异逐条
+// 列明，不再宣称无条件的「换实现不改变行为」，#86）：
 //
+//   - 错误哨兵跨后端 errors.Is 兼容（#86）：本包哨兵对同文案错误等价判定，
+//     errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) 为 true——适配层
+//     绑 redisx 的哨兵跑在 etcdx 上（或反向）错误分类不漂移。ErrNotOwner
+//     与 redisx 侧的「非本人锁」哨兵文案不同，不参与跨包等价。
+//   - Unlock 非持有者**显式报错**：本包返回 ErrNotOwner；redisx 自其对齐
+//     修复（其 #115）起同样对非持有者显式报错而非静默 no-op——静默会让
+//     「锁没放掉」不可观测，调用方误以为已释放。
 //   - ttl 必须为正：ttl≤0 直接报错（与 redisx 的 "ttl must be positive"
 //     对齐，#62）——此前 etcdx 把零值/负值静默抬成 1s，同一份代码换后端
 //     一个立刻报错、一个悄悄持 1s 锁。etcd 租约秒级精度，(0, 1s) 的亚秒
