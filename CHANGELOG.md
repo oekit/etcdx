@@ -2,6 +2,15 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.2.8] — 2026-11-09
+
+- fix(registry): 配置 watch 重建投递已删键空串——对齐 Delete 事件承诺（#83）
+- fix(registry): 重复 Subscribe 等旧 goroutine 退出——过期快照不再最后交付（#84）
+- fix(registry): watch 重建退避成功即归零——不再 30s 常态延迟（#85）
+- fix(distlock): 哨兵跨包 errors.Is 等价 + Unlock 非持有者口径与 redisx 对齐（#86）
+
+关联问题单：etcdx#83、etcdx#84、etcdx#85、etcdx#86。
+
 ## [v0.2.7] — 2026-11-08
 
 - build: 依赖地板对齐——本版把 oekit 依赖地板抬到各依赖当前最新已发布版本（matrix-tools/scripts/align_floors.py 维护轮）
