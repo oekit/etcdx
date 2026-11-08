@@ -2,6 +2,12 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.2.9] — 2026-11-09
+
+- fix(registry): 订阅循环回调 panic 隔离——一次 panic 不再杀死重建循环（#87）
+
+关联问题单：etcdx#87。
+
 ## [v0.2.8] — 2026-11-09
 
 - fix(registry): 配置 watch 重建投递已删键空串——对齐 Delete 事件承诺（#83）
