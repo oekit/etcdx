@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,7 +39,9 @@ func NewSubscriber(cli *clientv3.Client, opts ...OptionFunc) (*Subscriber, error
 // Subscribe 订阅服务实例变更：订阅建立后先回调一次当前快照，随后后台 Watch
 // 推送增量——首次快照与后续事件走同一条订阅 goroutine 串行投递路径（#84）。
 // 回调在订阅专属 goroutine 中串行执行（**不会并发调用 cb**），回调内阻塞会
-// 延迟后续事件处理。同一服务重复订阅会替换旧订阅：旧观察 goroutine 被标记
+// 延迟后续事件处理。cb panic 不会终结观察循环：panic 被就地 recover 转
+// Error 日志（含调用栈），本次投递跳过，后续变更照常推送（#87）。同一服务
+// 重复订阅会替换旧订阅：旧观察 goroutine 被标记
 // 取代并取消，其未投递的过期快照被丢弃；新订阅等旧 goroutine 退出后才开始
 // 投递，新旧回调从不错峰并发（#84）。替换不阻塞 Subscribe 调用方，但旧回调
 // 永久阻塞会拖住新订阅的首次投递——不要在回调内阻塞，也不要在回调内对同一
@@ -89,8 +92,9 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 			return
 		}
 		// 首次快照：与后续事件同一条串行路径（#84），不再是「同步第一次 +
-		// 异步后续」两条交错路径
-		cb(decodeAll(serviceName, s.opt.Group, resp))
+		// 异步后续」两条交错路径。cb panic 由 safeNotify 就地收编（#87）。
+		snap := decodeAll(serviceName, s.opt.Group, resp)
+		safeNotify(serviceName, func() { cb(snap) })
 
 		// 退避由**连续重建失败次数**派生（#85）：每轮快照重取失败 attempts++，
 		// 成功即归零——「重建成功」这个事实在结构上无法被忘记。旧实现把
@@ -125,7 +129,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 				if h.superseded.Load() {
 					return // 已被新订阅/退订取代：过期投递一律丢弃（#84）
 				}
-				cb(insts)
+				safeNotify(serviceName, func() { cb(insts) }) // cb panic 不终结循环（#87）
 			}
 			if h.ctx.Err() != nil {
 				return // Unsubscribe/Close：正常退出，不重建
@@ -152,8 +156,10 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 			if h.superseded.Load() {
 				return
 			}
-			// 重建成功前先回调一次快照（期间可能有实例变更，全量刷新一次视图）
-			cb(decodeAll(serviceName, s.opt.Group, resp))
+			// 重建成功前先回调一次快照（期间可能有实例变更，全量刷新一次视图）。
+			// cb panic 由 safeNotify 就地收编（#87）：重建循环自身不被回调炸穿。
+			snap := decodeAll(serviceName, s.opt.Group, resp)
+			safeNotify(serviceName, func() { cb(snap) })
 		}
 	})
 	return nil
@@ -222,6 +228,23 @@ func (h *watchHandle) supersede() {
 // close 由观察 goroutine defer 调用：退出即关闭 done，交接给新订阅。
 func (h *watchHandle) close() {
 	close(h.done)
+}
+
+// safeNotify 就地收编消费者回调的 panic（#87）：观察循环跑在 async.GoSafe
+// 的 goroutine 里，其兜底 recover 之后 goroutine 直接退出——回调一次 panic
+// 就杀死整条观察循环（#55/#64 修出的重建、退避、快照投递全部失效），订阅
+// 静默死亡而 Unsubscribe/StopListenConfig 仍返回 nil。观察循环语义天然允许
+// 「跳过一次投递」：panic 转 Error 日志（含调用栈）后循环继续，后续变更
+// 照常投递。target 仅用于日志定位（服务名 / 配置 dataID）。
+// Subscriber 与 ConfigStore 共用。
+func safeNotify(target string, notify func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("consumer callback panicked, skip this delivery and keep watching",
+				"target", target, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	notify()
 }
 
 // watch 重建的退避参数（Subscriber 与 ConfigStore 共用口径，#85）。

@@ -62,7 +62,9 @@ func (c *ConfigStore) GetConfig(ctx context.Context, dataID, group string) (stri
 
 // ListenConfig 监听配置变更：Put 事件回调新内容，Delete 事件回调空字符串。
 // 不回放当前值（需要初值请先 GetConfig）。回调在监听专属 goroutine 中串行
-// 执行（不会并发调用 onChange）。同一键重复监听会替换旧监听：旧观察
+// 执行（不会并发调用 onChange）。onChange panic 不会终结监听循环：panic 被
+// 就地 recover 转 Error 日志（含调用栈），本次投递跳过，后续变更照常推送
+// （#87）。同一键重复监听会替换旧监听：旧观察
 // goroutine 被标记取代并取消，其未投递的过期内容被丢弃，新监听等旧
 // goroutine 退出后才开始投递，新旧回调从不错峰并发（#84）。替换不阻塞
 // ListenConfig 调用方，但旧回调永久阻塞会拖住新监听的首次投递。监听生命
@@ -132,9 +134,9 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 				}
 				for _, ev := range wresp.Events {
 					if ev.Type == clientv3.EventTypeDelete {
-						onChange("")
+						safeNotify(dataID, func() { onChange("") }) // onChange panic 不终结循环（#87）
 					} else {
-						onChange(string(ev.Kv.Value))
+						safeNotify(dataID, func() { onChange(string(ev.Kv.Value)) })
 					}
 				}
 			}
@@ -168,9 +170,9 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 			// 可纠正。
 			if val, gerr := c.cli.Get(h.ctx, key); gerr == nil {
 				if len(val.Kvs) > 0 {
-					onChange(string(val.Kvs[0].Value))
+					safeNotify(dataID, func() { onChange(string(val.Kvs[0].Value)) }) // #87
 				} else {
-					onChange("")
+					safeNotify(dataID, func() { onChange("") }) // #87
 				}
 			}
 		}
