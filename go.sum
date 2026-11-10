@@ -48,8 +48,8 @@ github.com/oekit/concurrency v0.32.0 h1:Mj8+L9eU9uzDP/UB6DV4ujcjWvYm7HxwfZ765UnT
 github.com/oekit/concurrency v0.32.0/go.mod h1:fJU9ZyntXOIEk2EEWpRgc/TDagJnvoDmNePiSpSo720=
 github.com/oekit/core v0.14.0 h1:8WCA2IKby8ovvQx8IvMhO+LIWjdEjkSQJvBPkmFLuNg=
 github.com/oekit/core v0.14.0/go.mod h1:HhBTwYHU5MUp9tfNvHjfZv6P4yglQmn4jKmz98dUIsM=
-github.com/oekit/logx v0.9.1 h1:O0u46MKiCgbH5il7uGr3CeRyfoTGHTeQhw15qkkqSp8=
-github.com/oekit/logx v0.9.1/go.mod h1:Uz4rVbiHxjTUtdskV5mOSrC7mAFGlsi5vAud3g+L/Hs=
+github.com/oekit/logx v0.9.2 h1:8RjQPrlVU7QjQqieqGrOY2RGpJD5fPKkB/rekTg+qAo=
+github.com/oekit/logx v0.9.2/go.mod h1:OC5PMAH8VCq/nerGp72T6JJwwb9xoe0hCVEJ0kkXuL8=
 github.com/oekit/registry v0.5.12 h1:0xuPhiRqiBelE7o6UcJH3hyo+tiKQgPdjQpHrs73oiU=
 github.com/oekit/registry v0.5.12/go.mod h1:EF7qwU3ZksKO6JBRbHbOH/olrz//vJ3w3dQZtxkYP30=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
