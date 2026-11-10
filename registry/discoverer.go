@@ -52,12 +52,26 @@ func fetchInstances(ctx context.Context, cli *clientv3.Client, prefix, group, se
 	if service == "" {
 		return nil, fmt.Errorf("etcdx registry: service name is empty")
 	}
-	resp, err := cli.Get(ctx, serviceDir(prefix, group, service), clientv3.WithPrefix())
+	// 键层级边界 fail-fast（#110）：名称段含 "/" 的服务/分组不被发现——
+	// 拼出的前缀会越界命中其他服务（或被其他服务命中）的键空间
+	if err := checkName("service", service); err != nil {
+		return nil, err
+	}
+	if err := checkName("group", group); err != nil {
+		return nil, err
+	}
+	dir := serviceDir(prefix, group, service)
+	resp, err := cli.Get(ctx, dir, clientv3.WithPrefix())
 	if err != nil {
 		return nil, fmt.Errorf("etcdx registry: get %s: %w", service, err)
 	}
 	out := make([]regcore.Instance, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
+		if !validInstanceKey(kv.Key, dir) {
+			log.Warn("skip out-of-boundary instance key (legacy slash name)",
+				"key", string(kv.Key), "dir", dir)
+			continue
+		}
 		inst, err := decodeInstance(service, group, kv.Value)
 		if err != nil {
 			log.Warn("skip malformed instance", "key", string(kv.Key), "err", err)

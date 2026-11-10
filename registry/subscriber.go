@@ -50,6 +50,15 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 	if serviceName == "" {
 		return fmt.Errorf("etcdx registry: service name is empty")
 	}
+	// 键层级边界 fail-fast（#110）：含 "/" 的服务/分组名拼出的 watch 前缀
+	// 会越界命中其他服务的键空间，快照里混入解码成 Service="order" 的
+	// order/v2 实例
+	if err := checkName("service", serviceName); err != nil {
+		return err
+	}
+	if err := checkName("group", s.opt.Group); err != nil {
+		return err
+	}
 	if cb == nil {
 		return fmt.Errorf("etcdx registry: subscribe callback is nil")
 	}
@@ -93,7 +102,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 		}
 		// 首次快照：与后续事件同一条串行路径（#84），不再是「同步第一次 +
 		// 异步后续」两条交错路径。cb panic 由 safeNotify 就地收编（#87）。
-		snap := decodeAll(serviceName, s.opt.Group, resp)
+		snap := decodeAll(serviceName, s.opt.Group, dir, resp)
 		safeNotify(serviceName, func() { cb(snap) })
 
 		// 退避由**连续重建失败次数**派生（#85）：每轮快照重取失败 attempts++，
@@ -158,7 +167,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 			}
 			// 重建成功前先回调一次快照（期间可能有实例变更，全量刷新一次视图）。
 			// cb panic 由 safeNotify 就地收编（#87）：重建循环自身不被回调炸穿。
-			snap := decodeAll(serviceName, s.opt.Group, resp)
+			snap := decodeAll(serviceName, s.opt.Group, dir, resp)
 			safeNotify(serviceName, func() { cb(snap) })
 		}
 	})
@@ -189,9 +198,14 @@ func (s *Subscriber) Close(_ context.Context) error {
 	return nil
 }
 
-func decodeAll(service, group string, resp *clientv3.GetResponse) []regcore.Instance {
+func decodeAll(service, group, dir string, resp *clientv3.GetResponse) []regcore.Instance {
 	out := make([]regcore.Instance, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
+		if !validInstanceKey(kv.Key, dir) {
+			log.Warn("skip out-of-boundary instance key (legacy slash name)",
+				"key", string(kv.Key), "dir", dir)
+			continue
+		}
 		inst, err := decodeInstance(service, group, kv.Value)
 		if err != nil {
 			log.Warn("skip malformed instance", "key", string(kv.Key), "err", err)

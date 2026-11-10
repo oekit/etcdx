@@ -112,3 +112,87 @@ func TestLockerErrorSurfaceConsistentClassification(t *testing.T) {
 	}
 	_ = locker.Close(ctx)
 }
+
+// TestSentinelCompatBidirectionalViaIsOneOf 钉住 #112：跨包等价的双向入口
+// 是 IsOneOf——裸 errors.Is 的等价挂在链头错误的 Is 方法上，redisx 侧哨兵
+// 是无 Is 方法的普通 errors.New 值，errors.Is(redisx 哨兵, etcdx 哨兵) 走
+// 值比较恒 false（本仓无法单侧修复，治本须 redisx 侧实现同款 Is 或双方
+// 共用同一值）；适配层绑**本包**哨兵、后端跑 redisx 时（err 链上是 redisx
+// 哨兵），必须用 IsOneOf 分类才不漂移——否则 ErrLockTimeout 被当成 5xx/
+// 未知错误，「429 变 500」换个方向复活。变异性负对照：把 IsOneOf 的链上
+// 同文案判定删掉，本测试即转红。
+func TestSentinelCompatBidirectionalViaIsOneOf(t *testing.T) {
+	// 事实钉住：裸 errors.Is 反方向恒 false——注释与适配层不得按「裸 errors.Is
+	// 双向成立」来写（#112 的缺陷本体）
+	if errors.Is(redisxLikeSentinel("lock acquire timeout"), ErrLockTimeout) {
+		t.Error("errors.Is(redisx哨兵, etcdx.ErrLockTimeout) = true；裸 errors.Is 反方向仍是值比较，钉住事实防止注释再度失真")
+	}
+
+	// IsOneOf：反方向（redisx 哨兵在链上、etcdx 哨兵做 target）等价成立
+	if !IsOneOf(redisxLikeSentinel("lock acquire timeout"), ErrLockTimeout) {
+		t.Error("IsOneOf(redisx同文案哨兵, ErrLockTimeout) = false; want true（#112）")
+	}
+	if !IsOneOf(redisxLikeSentinel("lock not acquired"), ErrLockNotAcquired) {
+		t.Error("IsOneOf(redisx同文案哨兵, ErrLockNotAcquired) = false; want true（#112）")
+	}
+	// wrap 链上的 redisx 哨兵同样命中（适配层常再包一层）
+	wrapped := fmt.Errorf("deploy lock: %w", redisxLikeSentinel("lock acquire timeout"))
+	if !IsOneOf(wrapped, ErrLockTimeout) {
+		t.Error("wrap 链上的 redisx 同文案哨兵对 IsOneOf 判定 false; want true")
+	}
+	// 正方向（etcdx 哨兵在链上、redisx 同文案哨兵做 target）不回退（#86）
+	if !IsOneOf(ErrLockNotAcquired, redisxLikeSentinel("lock not acquired")) {
+		t.Error("IsOneOf(ErrLockNotAcquired, redisx同文案哨兵) = false; want true（#86 正方向不得回退）")
+	}
+
+	// 负对照：不是「随便返回 true」
+	if IsOneOf(redisxLikeSentinel("lock acquire timeout"), ErrLockNotAcquired) {
+		t.Error("文案不同的同族哨兵不得互判")
+	}
+	if IsOneOf(context.DeadlineExceeded, ErrLockTimeout) {
+		t.Error("IsOneOf(DeadlineExceeded, ErrLockTimeout) = true; want false")
+	}
+	if IsOneOf(redisxLikeSentinel("lock acquire timeout"), nil) {
+		t.Error("nil target 不得参与判定")
+	}
+	if IsOneOf(nil, ErrLockTimeout) {
+		t.Error("IsOneOf(nil, ...) = true; want false")
+	}
+	if IsOneOf(redisxLikeSentinel("lock acquire timeout")) {
+		t.Error("targets 为空不得判 true")
+	}
+}
+
+// TestAdapterClassificationIndependentOfBoundSide 钉住 #112 的行为级用例
+// （#86 行为级用例的反方向）：同一适配层**绑 etcdx 哨兵**做错误分类，后端
+// 给来的是 redisx 形态的错误（无 Is 方法的同文案哨兵、可再包一层）——
+// 用 IsOneOf 后与「绑 redisx 哨兵跑 etcdx」的分类完全一致：429/500 不随
+// 「绑哪一侧」漂移。
+func TestAdapterClassificationIndependentOfBoundSide(t *testing.T) {
+	classify := func(err error) string {
+		switch {
+		case err == nil:
+			return "ok"
+		case IsOneOf(err, ErrLockNotAcquired):
+			return "busy" // 429 / 不重试
+		case IsOneOf(err, ErrLockTimeout):
+			return "timeout" // 429 / 不重试
+		default:
+			return "internal" // 500
+		}
+	}
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"redisx 后端裸哨兵", redisxLikeSentinel("lock not acquired"), "busy"},
+		{"redisx 后端 wrap 链", fmt.Errorf("deploy: %w", redisxLikeSentinel("lock acquire timeout")), "timeout"},
+		{"etcdx 后端链（正方向不回退）", fmt.Errorf("deploy: %w", ErrLockNotAcquired), "busy"},
+	}
+	for _, tc := range cases {
+		if got := classify(tc.err); got != tc.want {
+			t.Errorf("%s: 分类 = %s (err=%v); want %s", tc.name, got, tc.err, tc.want)
+		}
+	}
+}

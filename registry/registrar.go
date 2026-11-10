@@ -79,7 +79,11 @@ func (r *Registrar) Register(ctx context.Context, inst regcore.Instance) error {
 	if err := validateInstance(inst); err != nil {
 		return err
 	}
+	// 解析后的 group（含 WithGroup 选项值）同样过一遍层级边界校验（#110）
 	group := r.opt.group(inst.Group)
+	if err := checkName("group", group); err != nil {
+		return err
+	}
 	key := instanceKey(r.opt.Prefix, group, inst.Service, inst.Addr())
 	val, err := encodeInstance(inst)
 	if err != nil {
@@ -130,7 +134,11 @@ func (r *Registrar) Deregister(ctx context.Context, inst regcore.Instance) error
 	if err := validateInstance(inst); err != nil {
 		return err
 	}
-	key := instanceKey(r.opt.Prefix, r.opt.group(inst.Group), inst.Service, inst.Addr())
+	group := r.opt.group(inst.Group)
+	if err := checkName("group", group); err != nil {
+		return err
+	}
+	key := instanceKey(r.opt.Prefix, group, inst.Service, inst.Addr())
 	r.mu.Lock()
 	reg := r.regs[key]
 	delete(r.regs, key)

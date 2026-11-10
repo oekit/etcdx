@@ -3,14 +3,17 @@
 // ownerID 语义），Go 结构化类型下两种后端可直接互换，业务代码面向
 // Locker 接口编程即可。
 //
-// # 跨后端错误面（#86）
+// # 跨后端错误面（#86/#112）
 //
-// 错误哨兵跨后端 errors.Is 兼容：本包哨兵对**同文案**错误等价判定，
-// errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) 为 true——适配层
-// 绑 redisx 的哨兵跑在 etcdx 上（或反向），「锁被占用」「获取超时」的
-// 错误分类不漂移。Unlock 对非持有者显式报 ErrNotOwner（redisx 侧同样在
-// 其 #115 对齐为显式报错），两侧不再一边静默一边报错。机制级差异（亚秒
-// TTL 精度、降级放行面）见 Locker 接口注释的统一口径。
+// 错误哨兵跨后端等价判定：本包哨兵对**同文案**错误等价，etcdx 哨兵在错误
+// 链上时 errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) 为 true。
+// 注意裸 errors.Is 的跨包等价是**单向**的（#112：redisx 侧哨兵是无 Is 方法
+// 的普通 errors.New 值，反方向走值比较恒 false，本包无法单侧修复）——
+// 「绑哪一侧的哨兵都能正确分类」的双向入口是 [IsOneOf]，适配层无论绑哪侧
+// 哨兵都用它分类，「锁被占用」「获取超时」的错误分类不漂移。Unlock 对非
+// 持有者显式报 ErrNotOwner（redisx 侧同样在其 #115 对齐为显式报错），两侧
+// 不再一边静默一边报错。机制级差异（亚秒 TTL 精度、降级放行面）见 Locker
+// 接口注释的统一口径。
 //
 // # 实现机制
 //

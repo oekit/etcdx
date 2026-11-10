@@ -39,7 +39,11 @@ func (c *ConfigStore) PutConfig(ctx context.Context, dataID, group, content stri
 	if dataID == "" {
 		return fmt.Errorf("etcdx registry: dataID is empty")
 	}
-	if _, err := c.cli.Put(ctx, configKey(c.opt.Prefix, c.opt.group(group), dataID), content); err != nil {
+	g := c.opt.group(group)
+	if err := c.checkConfigName(dataID, g); err != nil {
+		return err
+	}
+	if _, err := c.cli.Put(ctx, configKey(c.opt.Prefix, g, dataID), content); err != nil {
 		return fmt.Errorf("etcdx registry: put config %s: %w", dataID, err)
 	}
 	return nil
@@ -50,7 +54,11 @@ func (c *ConfigStore) GetConfig(ctx context.Context, dataID, group string) (stri
 	if dataID == "" {
 		return "", fmt.Errorf("etcdx registry: dataID is empty")
 	}
-	resp, err := c.cli.Get(ctx, configKey(c.opt.Prefix, c.opt.group(group), dataID))
+	g := c.opt.group(group)
+	if err := c.checkConfigName(dataID, g); err != nil {
+		return "", err
+	}
+	resp, err := c.cli.Get(ctx, configKey(c.opt.Prefix, g, dataID))
 	if err != nil {
 		return "", fmt.Errorf("etcdx registry: get config %s: %w", dataID, err)
 	}
@@ -58,6 +66,17 @@ func (c *ConfigStore) GetConfig(ctx context.Context, dataID, group string) (stri
 		return "", nil
 	}
 	return string(resp.Kvs[0].Value), nil
+}
+
+// checkConfigName 校验配置键的两个路径段（#110）：dataID 含 "/" 时与
+// group 分隔符不可区分——group "g/a"+dataID "b" 与 group "g"+dataID
+// "a/b" 拼出同一个键，跨 group 串扰；configKey 是精确读写（非前缀扫描），
+// 歧义只发生在键构造这一步，fail-fast 即封闭。
+func (c *ConfigStore) checkConfigName(dataID, group string) error {
+	if err := checkName("dataID", dataID); err != nil {
+		return err
+	}
+	return checkName("group", group)
 }
 
 // ListenConfig 监听配置变更：Put 事件回调新内容，Delete 事件回调空字符串。
@@ -72,6 +91,9 @@ func (c *ConfigStore) GetConfig(ctx context.Context, dataID, group string) (stri
 func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, onChange func(data string)) error {
 	if dataID == "" {
 		return fmt.Errorf("etcdx registry: dataID is empty")
+	}
+	if err := c.checkConfigName(dataID, c.opt.group(group)); err != nil {
+		return err
 	}
 	if onChange == nil {
 		return fmt.Errorf("etcdx registry: onChange callback is nil")
@@ -182,7 +204,11 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 
 // StopListenConfig 停止监听（未监听为 no-op）。
 func (c *ConfigStore) StopListenConfig(_ context.Context, dataID, group string) error {
-	key := configKey(c.opt.Prefix, c.opt.group(group), dataID)
+	g := c.opt.group(group)
+	if err := c.checkConfigName(dataID, g); err != nil {
+		return err
+	}
+	key := configKey(c.opt.Prefix, g, dataID)
 	c.mu.Lock()
 	h := c.listeners[key]
 	delete(c.listeners, key)

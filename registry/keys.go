@@ -3,6 +3,7 @@ package registry
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	regcore "github.com/oekit/registry"
 )
@@ -57,11 +58,47 @@ func validateInstance(inst regcore.Instance) error {
 	if inst.Service == "" {
 		return fmt.Errorf("etcdx registry: service name is empty")
 	}
+	if err := checkName("service", inst.Service); err != nil {
+		return err
+	}
+	if inst.Group != "" {
+		if err := checkName("group", inst.Group); err != nil {
+			return err
+		}
+	}
 	if inst.IP == "" {
 		return fmt.Errorf("etcdx registry: instance ip is empty")
+	}
+	// IP 是实例键的最后一段（serviceDir + Addr()），同样不得越出层级边界
+	if err := checkName("ip", inst.IP); err != nil {
+		return err
 	}
 	if inst.Port <= 0 || inst.Port > 65535 {
 		return fmt.Errorf("etcdx registry: invalid port %d", inst.Port)
 	}
 	return nil
+}
+
+// checkName 校验键路径段（service/group/dataID/ip）的层级边界（#110）：键
+// 空间按 "/" 分层，路径段含 "/" 时与分隔符不可区分——service "order/v2" 的
+// 实例键落在 "order/" 前缀之下，Discover("order") 的前缀扫描连带返回
+// order/v2 的实例并解码成 Service="order"（流量被路由到另一个服务，全程无
+// 报错）；configKey 同构，group "g/a"+dataID "b" 与 group "g"+dataID "a/b"
+// 拼出同一个键。注册/发现/订阅/配置入口 fail-fast，把键层级边界变成构造期
+// 不变量；键布局本身不变，既有干净键完全兼容。
+func checkName(kind, name string) error {
+	if strings.Contains(name, "/") {
+		return fmt.Errorf("etcdx registry: %s name %q must not contain %q (key hierarchy boundary, #110)", kind, name, "/")
+	}
+	return nil
+}
+
+// validInstanceKey 判定 key 是否为 dir 之下的**单段**实例键（dir + addr）。
+// 前缀扫描（WithPrefix）会把 serviceDir 之下的一切都带回来，历史上含 "/"
+// 的 service 名写出的越界键（"order/v2" 落在 "order/" 之下）也混在其中——
+// 入口 fail-fast 后不可能再产生新脏键，但既有脏键仍在 etcd 里，段数不吻合
+// 的键一律跳过，不再跨服务参与路由（#110 防御纵深）。
+func validInstanceKey(key []byte, dir string) bool {
+	rest, ok := strings.CutPrefix(string(key), dir)
+	return ok && rest != "" && !strings.Contains(rest, "/")
 }
