@@ -2,6 +2,12 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [Unreleased]
+
+- fix(registry): group/service/dataID/ip 拒绝 "/"，键层级边界成构造期/入口期不变量（#110）——Discover("s") 不再连带返回 "s/x" 的实例：键结构纯字符串拼接，段内 "/" 与层级分隔符不可区分，服务 "order/v2" 的实例键落进 "order" 的前缀扫描范围且被解码成 Service="order" 返回，流量被路由到另一个服务；dataID 含 "/" 时 (group="a", dataID="b/c") 与 (group="a/b", dataID="c") 同键串扰。修法：validateKeySegment 入口 fail-fast（注册/发现/订阅/配置四入口）+ 默认分组构造期校验 + 读侧「直接子键」防御（遗留嵌套键不并入实例集）
+
+关联问题单：oekit/etcdx#110。
+
 ## [v0.2.11] — 2026-11-10
 
 - - build: 依赖地板对齐（第二轮发版后 floor sync，无代码变更）

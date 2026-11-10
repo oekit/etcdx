@@ -25,7 +25,11 @@ func NewDiscoverer(cli *clientv3.Client, opts ...OptionFunc) (*Discoverer, error
 	if cli == nil {
 		return nil, ErrNilClient
 	}
-	return &Discoverer{cli: cli, opt: applyOptions(opts)}, nil
+	opt, err := applyOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Discoverer{cli: cli, opt: opt}, nil
 }
 
 // Discover 返回服务当前存活实例（按地址排序，结果确定）；无实例返回
@@ -48,19 +52,26 @@ func (d *Discoverer) DiscoverAll(ctx context.Context, serviceName string) ([]reg
 }
 
 // fetchInstances 拉取并解码某服务下全部实例键；单个坏值跳过不致整批失败。
+// 服务名是键层级段，含 "/" 直接报错（#110）；前缀扫描只认服务目录的
+// 直接子键，名字带 "/" 的服务留下的更深一层键不并入（读侧防御）。
 func fetchInstances(ctx context.Context, cli *clientv3.Client, prefix, group, service string) ([]regcore.Instance, error) {
-	if service == "" {
-		return nil, fmt.Errorf("etcdx registry: service name is empty")
+	if err := validateKeySegment("service name", service); err != nil {
+		return nil, err
 	}
-	resp, err := cli.Get(ctx, serviceDir(prefix, group, service), clientv3.WithPrefix())
+	dir := serviceDir(prefix, group, service)
+	resp, err := cli.Get(ctx, dir, clientv3.WithPrefix())
 	if err != nil {
 		return nil, fmt.Errorf("etcdx registry: get %s: %w", service, err)
 	}
 	out := make([]regcore.Instance, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		inst, err := decodeInstance(service, group, kv.Value)
-		if err != nil {
-			log.Warn("skip malformed instance", "key", string(kv.Key), "err", err)
+		if !isDirectInstanceEntry(dir, kv.Key) {
+			log.Warn("skip nested key under service dir", "key", string(kv.Key), "service", service)
+			continue
+		}
+		inst, derr := decodeInstance(service, group, kv.Value)
+		if derr != nil {
+			log.Warn("skip malformed instance", "key", string(kv.Key), "err", derr)
 			continue
 		}
 		out = append(out, inst)

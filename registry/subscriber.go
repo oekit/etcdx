@@ -33,7 +33,11 @@ func NewSubscriber(cli *clientv3.Client, opts ...OptionFunc) (*Subscriber, error
 	if cli == nil {
 		return nil, ErrNilClient
 	}
-	return &Subscriber{cli: cli, opt: applyOptions(opts), subs: make(map[string]*watchHandle)}, nil
+	opt, err := applyOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Subscriber{cli: cli, opt: opt, subs: make(map[string]*watchHandle)}, nil
 }
 
 // Subscribe 订阅服务实例变更：订阅建立后先回调一次当前快照，随后后台 Watch
@@ -47,8 +51,9 @@ func NewSubscriber(cli *clientv3.Client, opts ...OptionFunc) (*Subscriber, error
 // 永久阻塞会拖住新订阅的首次投递——不要在回调内阻塞，也不要在回调内对同一
 // 服务再次 Subscribe。订阅生命周期与传入 ctx 无关，由 Unsubscribe 终止。
 func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func([]regcore.Instance)) error {
-	if serviceName == "" {
-		return fmt.Errorf("etcdx registry: service name is empty")
+	// 服务名是键层级段，含 "/" 直接报错（#110）
+	if err := validateKeySegment("service name", serviceName); err != nil {
+		return err
 	}
 	if cb == nil {
 		return fmt.Errorf("etcdx registry: subscribe callback is nil")
@@ -93,7 +98,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 		}
 		// 首次快照：与后续事件同一条串行路径（#84），不再是「同步第一次 +
 		// 异步后续」两条交错路径。cb panic 由 safeNotify 就地收编（#87）。
-		snap := decodeAll(serviceName, s.opt.Group, resp)
+		snap := decodeAll(dir, serviceName, s.opt.Group, resp)
 		safeNotify(serviceName, func() { cb(snap) })
 
 		// 退避由**连续重建失败次数**派生（#85）：每轮快照重取失败 attempts++，
@@ -158,7 +163,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 			}
 			// 重建成功前先回调一次快照（期间可能有实例变更，全量刷新一次视图）。
 			// cb panic 由 safeNotify 就地收编（#87）：重建循环自身不被回调炸穿。
-			snap := decodeAll(serviceName, s.opt.Group, resp)
+			snap := decodeAll(dir, serviceName, s.opt.Group, resp)
 			safeNotify(serviceName, func() { cb(snap) })
 		}
 	})
@@ -189,12 +194,18 @@ func (s *Subscriber) Close(_ context.Context) error {
 	return nil
 }
 
-func decodeAll(service, group string, resp *clientv3.GetResponse) []regcore.Instance {
+// decodeAll 解码前缀扫描到的全部实例值；只认服务目录的直接子键（名字带
+// "/" 的服务留下的更深一层键不并入，#110 读侧防御），单个坏值跳过。
+func decodeAll(dir, service, group string, resp *clientv3.GetResponse) []regcore.Instance {
 	out := make([]regcore.Instance, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		inst, err := decodeInstance(service, group, kv.Value)
-		if err != nil {
-			log.Warn("skip malformed instance", "key", string(kv.Key), "err", err)
+		if !isDirectInstanceEntry(dir, kv.Key) {
+			log.Warn("skip nested key under service dir", "key", string(kv.Key), "service", service)
+			continue
+		}
+		inst, derr := decodeInstance(service, group, kv.Value)
+		if derr != nil {
+			log.Warn("skip malformed instance", "key", string(kv.Key), "err", derr)
 			continue
 		}
 		out = append(out, inst)

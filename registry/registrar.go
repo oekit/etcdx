@@ -67,7 +67,11 @@ func NewRegistrar(cli *clientv3.Client, opts ...OptionFunc) (*Registrar, error) 
 	if cli == nil {
 		return nil, ErrNilClient
 	}
-	return &Registrar{cli: cli, opt: applyOptions(opts), regs: make(map[string]*registration)}, nil
+	opt, err := applyOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	return &Registrar{cli: cli, opt: opt, regs: make(map[string]*registration)}, nil
 }
 
 // Register 注册实例：Grant 租约 → Put 带租约的实例键 → 启动监护 goroutine。

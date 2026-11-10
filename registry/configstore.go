@@ -31,13 +31,33 @@ func NewConfigStore(cli *clientv3.Client, opts ...OptionFunc) (*ConfigStore, err
 	if cli == nil {
 		return nil, ErrNilClient
 	}
-	return &ConfigStore{cli: cli, opt: applyOptions(opts), listeners: make(map[string]*watchHandle)}, nil
+	opt, err := applyOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	return &ConfigStore{cli: cli, opt: opt, listeners: make(map[string]*watchHandle)}, nil
+}
+
+// validateConfigEntry 校验配置键的两段（group/dataID）：dataID 必须非空，
+// 非空 group 与 dataID 都不允许含 "/"（#110：configKey 纯拼接，
+// (group="a", dataID="b/c") 与 (group="a/b", dataID="c") 解析到同一个键，
+// 跨 group 串扰）；空 group 回退默认分组。
+func validateConfigEntry(dataID, group string) error {
+	if err := validateKeySegment("dataID", dataID); err != nil {
+		return err
+	}
+	if group != "" {
+		if err := validateKeySegment("group name", group); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // PutConfig 写入配置（SPI 之外的便捷方法：供运维脚本/测试灌配置）。
 func (c *ConfigStore) PutConfig(ctx context.Context, dataID, group, content string) error {
-	if dataID == "" {
-		return fmt.Errorf("etcdx registry: dataID is empty")
+	if err := validateConfigEntry(dataID, group); err != nil {
+		return err
 	}
 	if _, err := c.cli.Put(ctx, configKey(c.opt.Prefix, c.opt.group(group), dataID), content); err != nil {
 		return fmt.Errorf("etcdx registry: put config %s: %w", dataID, err)
@@ -47,8 +67,8 @@ func (c *ConfigStore) PutConfig(ctx context.Context, dataID, group, content stri
 
 // GetConfig 拉取配置内容；键不存在返回空字符串（非错误）。
 func (c *ConfigStore) GetConfig(ctx context.Context, dataID, group string) (string, error) {
-	if dataID == "" {
-		return "", fmt.Errorf("etcdx registry: dataID is empty")
+	if err := validateConfigEntry(dataID, group); err != nil {
+		return "", err
 	}
 	resp, err := c.cli.Get(ctx, configKey(c.opt.Prefix, c.opt.group(group), dataID))
 	if err != nil {
@@ -70,8 +90,8 @@ func (c *ConfigStore) GetConfig(ctx context.Context, dataID, group string) (stri
 // ListenConfig 调用方，但旧回调永久阻塞会拖住新监听的首次投递。监听生命
 // 周期与传入 ctx 无关，由 StopListenConfig 终止。
 func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, onChange func(data string)) error {
-	if dataID == "" {
-		return fmt.Errorf("etcdx registry: dataID is empty")
+	if err := validateConfigEntry(dataID, group); err != nil {
+		return err
 	}
 	if onChange == nil {
 		return fmt.Errorf("etcdx registry: onChange callback is nil")
@@ -182,6 +202,9 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 
 // StopListenConfig 停止监听（未监听为 no-op）。
 func (c *ConfigStore) StopListenConfig(_ context.Context, dataID, group string) error {
+	if err := validateConfigEntry(dataID, group); err != nil {
+		return err
+	}
 	key := configKey(c.opt.Prefix, c.opt.group(group), dataID)
 	c.mu.Lock()
 	h := c.listeners[key]

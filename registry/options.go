@@ -39,7 +39,7 @@ func WithTTL(ttl time.Duration) OptionFunc {
 	return func(o *Option) { o.TTL = ttl }
 }
 
-func applyOptions(opts []OptionFunc) *Option {
+func applyOptions(opts []OptionFunc) (*Option, error) {
 	o := &Option{Prefix: defaultPrefix, Group: defaultGroup, TTL: defaultTTL}
 	for _, fn := range opts {
 		if fn != nil {
@@ -56,7 +56,12 @@ func applyOptions(opts []OptionFunc) *Option {
 	if o.TTL < time.Second {
 		o.TTL = time.Second
 	}
-	return o
+	// 默认分组是键层级的一段：含 "/" 与层级分隔符不可区分（#110），构造期
+	// fail-fast（Option 非法值总则①），不等到首次注册/发现才爆
+	if err := validateKeySegment("group name", o.Group); err != nil {
+		return nil, err
+	}
+	return o, nil
 }
 
 // ttlSeconds 返回租约秒数（etcd Grant 以秒为单位）。
