@@ -29,21 +29,63 @@ var log = logx.Delegating("etcdx.distlock")
 // 跨包 errors.Is 恒 false，面向 Locker 接口的适配层换后端后错误分类随之
 // 漂移（429 变 500）。本类型让 etcdx 侧哨兵对文案相同的同义哨兵（redisx
 // 侧即普通 errors.New 同文案值）判定为 true：
-// errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) == true，
-// 适配层绑哪一侧的哨兵都能正确分类；与 context.DeadlineExceeded 等无关
-// 错误仍为 false。代价：任何文案完全相同的外部错误也会被判 true——本包
-// 哨兵文案均带锁定语义、无前缀冲突，误判面可忽略。
+// errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) == true。
+// 该等价是**单向**的（#112）：判定挂在链头错误的 Is 方法上，只有 etcdx
+// 哨兵在错误链上才生效——redisx 侧哨兵是无 Is 方法的普通 errors.New 值，
+// errors.Is(redisx.ErrLockTimeout, etcdx.ErrLockTimeout) 走值比较恒 false，
+// 本包无法单侧修复（治本须 redisx 侧哨兵实现同款 Is 或双方共用同一值）。
+// 「绑哪一侧的哨兵都能正确分类」的双向入口是包级 [IsOneOf]。与
+// context.DeadlineExceeded 等无关错误仍为 false。代价：任何文案完全相同的
+// 外部错误也会被判 true——本包哨兵文案均带锁定语义、无前缀冲突，误判面
+// 可忽略。
 type sentinel struct{ msg string }
 
 func (e sentinel) Error() string { return e.msg }
 
 // Is 支持 errors.Is 的 target 判定：同类型按值比较（== 已覆盖），外部
 // 同文案错误（含 redisx/distlock 的同名哨兵）视为同一语义错误（#86）。
+// 注意这只是「etcdx 哨兵在链上」方向；反方向见 [IsOneOf]（#112）。
 func (e sentinel) Is(target error) bool {
 	if target == nil {
 		return false
 	}
 	return target.Error() == e.msg
+}
+
+// IsOneOf 判定 err 是否等价于 targets 中的任一错误哨兵，使「绑哪一侧的
+// 哨兵都能正确分类」**双向**成立（#112）：errors.Is 的跨包等价挂在链头
+// 错误的 Is 方法上，redisx/distlock 的哨兵是无 Is 方法的普通 errors.New
+// 值——errors.Is(redisx.ErrLockTimeout, ErrLockTimeout) 走值比较恒 false，
+// 适配层绑本包哨兵、后端跑 redisx 时正常超时被误分类成 500（#86 承诺的
+// 反方向缺口）。本函数在 errors.Is 之外追加**链上同文案**判定：逐层
+// Unwrap，链上任何一层的文案与 target 一致即视为同一语义错误——与
+// sentinel.Is 的同文案口径一致（#86），wrap 链上的 redisx 哨兵也能命中。
+//
+// 用法（适配层无论绑哪侧哨兵，分类都正确）：
+//
+//	if distlock.IsOneOf(err, distlock.ErrLockTimeout) { /* 429 / 不重试 */ }
+//	if distlock.IsOneOf(err, redisxdistlock.ErrLockTimeout) { /* 同上 */ }
+//
+// 与 sentinel.Is 相同的代价：任何文案完全相同的外部错误也会判 true——
+// 哨兵文案均带锁定语义、无前缀冲突，误判面可忽略。
+func IsOneOf(err error, targets ...error) bool {
+	if err == nil || len(targets) == 0 {
+		return false
+	}
+	for _, target := range targets {
+		if target == nil {
+			continue
+		}
+		if errors.Is(err, target) {
+			return true
+		}
+		for e := err; e != nil; e = errors.Unwrap(e) {
+			if e.Error() == target.Error() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ErrLockNotAcquired 表示锁被其他持有者占用，获取失败。
@@ -60,9 +102,12 @@ var ErrNotOwner = sentinel{msg: "lock not owned by this owner"}
 // 两后端的统一口径（跨后端移植按此理解；「方法集同形」之外的行为差异逐条
 // 列明，不再宣称无条件的「换实现不改变行为」，#86）：
 //
-//   - 错误哨兵跨后端 errors.Is 兼容（#86）：本包哨兵对同文案错误等价判定，
-//     errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) 为 true——适配层
-//     绑 redisx 的哨兵跑在 etcdx 上（或反向）错误分类不漂移。ErrNotOwner
+//   - 错误哨兵跨后端兼容（#86/#112）：本包哨兵对同文案错误等价判定，
+//     errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) 为 true（etcdx
+//     哨兵在错误链上时）。**反方向**裸 errors.Is 仍为 false（#112：redisx
+//     侧哨兵是无 Is 方法的普通 errors.New 值，本包无法单侧修复）——「绑哪
+//     一侧的哨兵都能正确分类」的双向入口是 [IsOneOf]：适配层绑本包哨兵跑
+//     在 redisx 上（或反向）都用 IsOneOf 分类，错误分类不漂移。ErrNotOwner
 //     与 redisx 侧的「非本人锁」哨兵文案不同，不参与跨包等价。
 //   - Unlock 非持有者**显式报错**：本包返回 ErrNotOwner；redisx 自其对齐
 //     修复（其 #115）起同样对非持有者显式报错而非静默 no-op——静默会让
