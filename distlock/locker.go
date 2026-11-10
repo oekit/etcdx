@@ -99,6 +99,11 @@ type Locker interface {
 
 const defaultPrefix = "/oekit/distlock"
 
+// connProbeWindow 是加锁链路每一步网络交互的有界窗口（连接预检、租约 Grant
+// 各一个窗口，与调用方 ctx 取较小者）：预检与 Grant 之间 etcd 进入黑洞时，
+// caller 的 deadline 是唯一出口（#111）。
+const connProbeWindow = 3 * time.Second
+
 // EtcdLocker 是基于 etcd Session + concurrency.Mutex 的分布式锁实现。
 type EtcdLocker struct {
 	cli                 *clientv3.Client
@@ -270,10 +275,9 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	if ttl <= 0 {
 		return "", fmt.Errorf("etcdx distlock: ttl must be positive, got %v", ttl)
 	}
-	// 连接预检：NewSession 的 Grant 走 Session 自身的后台 ctx，对不可达
-	// etcd 会无限等待；先用轻量读在有界窗口内探活，失败直接降级/报错，
-	// 不创建注定挂死的 Session
-	pctx, pcancel := context.WithTimeout(ctx, 3*time.Second)
+	// 连接预检：轻量读在有界窗口内探活，失败直接降级/报错，不做后续网络
+	// 交互（#54：caller ctx 自身取消/超时 ≠ etcd 不可达，显式报错不降级）
+	pctx, pcancel := context.WithTimeout(ctx, connProbeWindow)
 	_, perr := l.cli.Get(pctx, l.prefix)
 	pcancel()
 	if perr != nil {
@@ -291,13 +295,33 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	// （redisx 侧走 SetNX 是精确毫秒 ⇒ 同一个 Locker 接口，200ms 的锁在
 	// redisx 是 200ms、在 etcd 是 1s。这是租约机制的精度限制，不是 bug，
 	// 但调用方按毫秒理解会误判 ⇒ 抬升时至少打 Warn 明示（#62），不再静默。）
-	ttlSec := int(ttl / time.Second)
-	if ttlSec < 1 {
-		ttlSec = 1
+	if ttl < time.Second {
 		log.Warn("sub-second ttl raised to 1s (etcd lease granularity is seconds)",
 			"key", key, "ttl", ttl)
 	}
-	session, err := concurrency.NewSession(l.cli, concurrency.WithTTL(ttlSec))
+	ttlSec := max(1, int(ttl/time.Second))
+	// 租约 Grant 显式化（#111）：此前 NewSession 内部的 Grant 走 Session
+	// 自身的后台 ctx（无任何 deadline），防护只覆盖「探测时已不可达」——
+	// 预检通过后、Grant 前 etcd 进入黑洞时 Lock 永久挂死，caller 的
+	// timeout/取消与 WithGracefulDegradation 全部失效（根本没有错误返回）。
+	// 现在 caller ctx 贯穿 Grant（WithRequireLeader 元数据让「无 leader」
+	// 快速失败而非干等），拿到租约后以 WithLease 组装 Session：NewSession
+	// 跳过内部 Grant，keepalive 仍由 Session 自身 ctx 管理，生命周期语义
+	// 不变，创建全程有界，失败走与预检相同的 degradeOrFail 分类。WithTTL
+	// 保留供 Session.Close 的 Revoke 窗口使用（租约实际 TTL 以服务端返回
+	// 为准，与 keepalive 无关）。
+	gctx, gcancel := context.WithTimeout(clientv3.WithRequireLeader(ctx), connProbeWindow)
+	grant, gerr := l.cli.Grant(gctx, int64(ttlSec))
+	gcancel()
+	if gerr != nil {
+		// 与预检同口径（#54）：caller ctx 自身取消/超时 ≠ etcd 不可达
+		if ctx.Err() != nil {
+			l.notify(key, false, ctx.Err())
+			return "", fmt.Errorf("etcdx distlock: caller context done while granting lease: %w", ctx.Err())
+		}
+		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: grant lease: %w", gerr))
+	}
+	session, err := concurrency.NewSession(l.cli, concurrency.WithLease(grant.ID), concurrency.WithTTL(ttlSec))
 	if err != nil {
 		if ctx.Err() != nil { // #54：caller ctx 问题显式报错
 			return "", fmt.Errorf("etcdx distlock: new session: %w", err)
