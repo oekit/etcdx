@@ -2,6 +2,14 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.2.12] — 2026-11-11
+
+- fix(registry): 键路径段（group/service/dataID/ip）含 "/" 入口 fail-fast + 前缀扫描过滤段数不吻合的既有脏键（#110）——service "order/v2" 的实例键落在 "order/" 前缀之下，Discover("order") 连带返回 order/v2 的实例并解码成 Service="order"，流量被路由到另一个服务且全程无报错；configKey 同构（group "g/a"+dataID "b" 与 group "g"+dataID "a/b" 拼出同一个键，跨 group 串扰）。注册/发现/订阅/配置入口把「键层级边界」变成构造期不变量；键布局不变，既有干净键完全兼容
+- fix(distlock): 建 Session 的租约 Grant 显式化并带上界（#111）——此前 NewSession 内部的 Grant 走 Session 自身的后台 ctx（无任何 deadline），连接预检只覆盖「探测时已不可达」，预检通过后 etcd 进入黑洞（网络分区/节点宕机切换）时 Lock 永久挂死，caller timeout/取消与 WithGracefulDegradation 全部失效（根本没有错误返回）。现在 caller ctx 贯穿 Grant（WithRequireLeader 元数据让「无 leader」快速失败 + 3s 窗口与预检同窗），拿到租约后以 WithLease 组装 Session——keepalive 仍由 Session 自身 ctx 管理，生命周期语义不变，失败走与预检相同的 degradeOrFail 分类
+- feat(distlock): 新增 IsOneOf——「绑哪一侧的哨兵都能正确分类」双向成立（#112）——裸 errors.Is 的跨包等价挂在链头错误的 Is 方法上，redisx 侧哨兵是无 Is 方法的普通 errors.New 值，errors.Is(redisx.ErrLockTimeout, etcdx.ErrLockTimeout) 恒 false，适配层绑 etcdx 哨兵跑 redisx 后端时正常超时被误分类成 500（#86 承诺的反方向缺口）。IsOneOf 在 errors.Is 之外追加链上同文案判定；裸 errors.Is 仍单向（治本须 redisx 侧哨兵实现同款 Is 或双方共用同一值），Locker 接口注释与 doc 同步修正
+
+关联问题单：etcdx#110、etcdx#111、etcdx#112。
+
 ## [v0.2.11] — 2026-11-10
 
 - - build: 依赖地板对齐（第二轮发版后 floor sync，无代码变更）
