@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +60,58 @@ func TestSentinelCrossPackageCompat(t *testing.T) {
 		ErrLockTimeout.Error() != "lock acquire timeout" ||
 		ErrNotOwner.Error() != "lock not owned by this owner" {
 		t.Error("哨兵文案变化会破坏跨包等价判定，必须保持逐字一致")
+	}
+}
+
+// TestSentinelCrossPackageCompatOneWayDirection 钉住 #112 修正后的契约：
+// 跨包等价是**单向**的。stdlib errors.Is 只在错误链一侧调用 Is 方法——反方向
+// errors.Is(redisx 哨兵, etcdx 哨兵) 中 redisx 侧的 errors.New 值（本文件
+// redisxLikeSentinel 同身份语义）无 Is 方法，与本包 sentinel 值比较也恒不等，
+// etcdx 侧任何写法都无法让反方向变 true（真正双向需 redisx 侧实现同款 Is
+// 或双方共用哨兵类型，跨仓另行处理）。#86 注释曾按「双向」承诺（「绑哪一侧
+// 的哨兵都能正确分类」「或反向」），本用例按实际语义钉住方向，防止下游按
+// 双向写适配层。
+func TestSentinelCrossPackageCompatOneWayDirection(t *testing.T) {
+	// 反方向：恒 false（把方向写死，误用即红）
+	if errors.Is(redisxLikeSentinel("lock acquire timeout"), ErrLockTimeout) {
+		t.Error("errors.Is(redisx同文案哨兵, ErrLockTimeout) = true; want false（单向等价，#112）")
+	}
+	if errors.Is(redisxLikeSentinel("lock not acquired"), ErrLockNotAcquired) {
+		t.Error("errors.Is(redisx同文案哨兵, ErrLockNotAcquired) = true; want false（单向等价，#112）")
+	}
+
+	// 适配层绑定矩阵（#112）：errors.Is 只查错误链一侧的 Is ⇒
+	//   - target 绑 redisx 侧哨兵：etcdx 后端错误经 sentinel.Is 同文案 ✓、
+	//     redisx 后端错误按值身份 ✓ ——两后端通用（推荐绑定形态）
+	//   - target 绑 etcdx 侧哨兵：etcdx 后端 ✓（值身份）、redisx 后端 ✗（上
+	//     方反方向恒 false）——跑在 redisx 后端把 ErrLockTimeout 当未知错误
+	redisxSentinel := redisxLikeSentinel("lock acquire timeout")
+	etcdxChain := fmt.Errorf("deploy lock: %w", ErrLockTimeout)
+	if !errors.Is(etcdxChain, redisxSentinel) {
+		t.Error("绑 redisx 侧哨兵：etcdx 后端错误分类失败; want true")
+	}
+	if !errors.Is(redisxSentinel, redisxSentinel) {
+		t.Error("绑 redisx 侧哨兵：redisx 后端错误分类失败; want true")
+	}
+}
+
+// TestSentinelContractCommentOneWay 钉住 #112 的契约文本面：本缺陷的主体是
+// 注释承诺与实测语义不符（承诺「双向」、实测单向），文档不得再出现已被证伪
+// 的双向承诺——否则下游按「绑哪一侧都能分类」写适配层，在 redisx 后端上把
+// ErrLockTimeout 误分类成 5xx。等价方向的语义由
+// TestSentinelCrossPackageCompatOneWayDirection 钉住。
+func TestSentinelContractCommentOneWay(t *testing.T) {
+	overPromise := []string{"绑哪一侧的哨兵都能正确分类", "或反向）错误分类不漂移", "（或反向）"}
+	for _, file := range []string{"locker.go", "doc.go"} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		for _, phrase := range overPromise {
+			if strings.Contains(string(src), phrase) {
+				t.Errorf("%s 仍承诺双向跨包等价（%q）; want 删除双向承诺并写明单向（#112）", file, phrase)
+			}
+		}
 	}
 }
 

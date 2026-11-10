@@ -29,10 +29,16 @@ var log = logx.Delegating("etcdx.distlock")
 // 跨包 errors.Is 恒 false，面向 Locker 接口的适配层换后端后错误分类随之
 // 漂移（429 变 500）。本类型让 etcdx 侧哨兵对文案相同的同义哨兵（redisx
 // 侧即普通 errors.New 同文案值）判定为 true：
-// errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) == true，
-// 适配层绑哪一侧的哨兵都能正确分类；与 context.DeadlineExceeded 等无关
-// 错误仍为 false。代价：任何文案完全相同的外部错误也会被判 true——本包
-// 哨兵文案均带锁定语义、无前缀冲突，误判面可忽略。
+// errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) == true。**等价是
+// 单向的**（#112）：stdlib errors.Is 只在错误链一侧调用 Is 方法，反向
+// errors.Is(redisx.ErrLockTimeout, etcdx.ErrLockTimeout) 中 redisx 的
+// errors.New 值无 Is 方法、退回值比较恒 false——「绑哪一侧都能分类」不
+// 成立（真正双向需 redisx 侧实现同款 Is 或双方共用哨兵类型，跨仓）。适配层应把 target 绑在 **redisx 侧哨兵**（普通 errors.New 值）上：
+// 错误链来自任一后端都能正确分类；绑 etcdx 哨兵只在 etcdx 后端正确，跑在
+// redisx 后端会把 ErrLockTimeout 误分类成未知错误（429 变 500）。与
+// context.DeadlineExceeded 等无关错误仍为 false。代价：任何文案完全相同的
+// 外部错误也会被判 true——本包哨兵文案均带锁定语义、无前缀冲突，误判面
+// 可忽略。
 type sentinel struct{ msg string }
 
 func (e sentinel) Error() string { return e.msg }
@@ -60,9 +66,13 @@ var ErrNotOwner = sentinel{msg: "lock not owned by this owner"}
 // 两后端的统一口径（跨后端移植按此理解；「方法集同形」之外的行为差异逐条
 // 列明，不再宣称无条件的「换实现不改变行为」，#86）：
 //
-//   - 错误哨兵跨后端 errors.Is 兼容（#86）：本包哨兵对同文案错误等价判定，
-//     errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) 为 true——适配层
-//     绑 redisx 的哨兵跑在 etcdx 上（或反向）错误分类不漂移。ErrNotOwner
+//   - 错误哨兵跨后端 errors.Is **单向**等价（#86，方向修正 #112）：本包哨兵
+//     对同文案错误等价判定，errors.Is(etcdx.ErrLockTimeout,
+//     redisx.ErrLockTimeout) 为 true；反向
+//     errors.Is(redisx.ErrLockTimeout, etcdx.ErrLockTimeout) 恒 false（stdlib
+//     errors.Is 只查错误链一侧的 Is，redisx 侧 errors.New 值无 Is 方法）。
+//     适配层把 target 绑在 redisx 侧哨兵上即可两后端通用、错误分类不漂移；
+//     绑 etcdx 哨兵跑在 redisx 后端会误分类。ErrNotOwner
 //     与 redisx 侧的「非本人锁」哨兵文案不同，不参与跨包等价。
 //   - Unlock 非持有者**显式报错**：本包返回 ErrNotOwner；redisx 自其对齐
 //     修复（其 #115）起同样对非持有者显式报错而非静默 no-op——静默会让

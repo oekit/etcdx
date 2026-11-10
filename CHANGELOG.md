@@ -6,8 +6,9 @@
 
 - fix(registry): group/service/dataID/ip 拒绝 "/"，键层级边界成构造期/入口期不变量（#110）——Discover("s") 不再连带返回 "s/x" 的实例：键结构纯字符串拼接，段内 "/" 与层级分隔符不可区分，服务 "order/v2" 的实例键落进 "order" 的前缀扫描范围且被解码成 Service="order" 返回，流量被路由到另一个服务；dataID 含 "/" 时 (group="a", dataID="b/c") 与 (group="a/b", dataID="c") 同键串扰。修法：validateKeySegment 入口 fail-fast（注册/发现/订阅/配置四入口）+ 默认分组构造期校验 + 读侧「直接子键」防御（遗留嵌套键不并入实例集）
 - fix(distlock): 加锁建 Session 全程有界，Grant 黑洞不再永久挂死（#111）——concurrency.NewSession 内部 Grant 无 deadline，探测成功后、Grant 之前 etcd 进黑洞即永久阻塞，Lock 远超声明 timeout 不返回，caller ctx/timeout 与优雅降级面全部失效；修法为与预检同窗 3s 的显式 Grant + WithLease 组装 Session，创建全程有界，失败走既有 degradeOrFail 分类
+- fix(distlock): 哨兵跨包 errors.Is 契约降级为单向等价并写明方向（#112）——#86 注释承诺「绑哪一侧的哨兵都能正确分类」不成立：stdlib errors.Is 只在错误链一侧调用 Is，反向 errors.Is(redisx 哨兵, etcdx 哨兵) 恒 false；修法为注释/包文档写明单向语义与推荐绑定（target 绑 redisx 侧哨兵两后端通用），errors_compat_test 补反方向用例钉住真实语义并钉死文档不再出现双向承诺
 
-关联问题单：oekit/etcdx#110、oekit/etcdx#111。
+关联问题单：oekit/etcdx#110、oekit/etcdx#111、oekit/etcdx#112。
 
 ## [v0.2.11] — 2026-11-10
 
