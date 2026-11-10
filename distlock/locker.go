@@ -270,9 +270,8 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	if ttl <= 0 {
 		return "", fmt.Errorf("etcdx distlock: ttl must be positive, got %v", ttl)
 	}
-	// 连接预检：NewSession 的 Grant 走 Session 自身的后台 ctx，对不可达
-	// etcd 会无限等待；先用轻量读在有界窗口内探活，失败直接降级/报错，
-	// 不创建注定挂死的 Session
+	// 连接预检：先用轻量读在有界窗口内探活，快速失败/降级；建 Session 的
+	// Grant 同样有界（见下），加锁链路创建全程无无界等待（#111）
 	pctx, pcancel := context.WithTimeout(ctx, 3*time.Second)
 	_, perr := l.cli.Get(pctx, l.prefix)
 	pcancel()
@@ -297,8 +296,30 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 		log.Warn("sub-second ttl raised to 1s (etcd lease granularity is seconds)",
 			"key", key, "ttl", ttl)
 	}
-	session, err := concurrency.NewSession(l.cli, concurrency.WithTTL(ttlSec))
+	// 显式有界 Grant + WithLease 组装 Session（#111）：concurrency.NewSession
+	// 内部的 Grant 走 Session 自身的后台 ctx、无任何 deadline——探测成功后
+	// etcd 在 Grant 前进入黑洞（丢包/断连）时它永久阻塞，Lock 的 timeout 参数
+	// 只包住后面的 m.Lock，包不住 Session 创建 ⇒ Lock 远超声明的 timeout 也不
+	// 返回，caller ctx 取消/超时不被感知，WithGracefulDegradation 的降级面也
+	// 因「没有错误返回」永不触发。改为与预检同窗（3s）的显式 Grant，拿到
+	// 租约后 WithLease 组装 Session（不再发起无界 RPC，keepalive 仍由 Session
+	// 自身 ctx 管理）——创建全程有界，失败走既有 degradeOrFail 分类。
+	gctx, gcancel := context.WithTimeout(ctx, 3*time.Second)
+	grant, gerr := l.cli.Grant(gctx, int64(ttlSec))
+	gcancel()
+	if gerr != nil {
+		if ctx.Err() != nil { // #54：caller ctx 问题显式报错，不进降级面
+			l.notify(key, false, ctx.Err())
+			return "", fmt.Errorf("etcdx distlock: caller context done while granting lease: %w", ctx.Err())
+		}
+		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: grant lease: %w", gerr))
+	}
+	session, err := concurrency.NewSession(l.cli, concurrency.WithLease(grant.ID))
 	if err != nil {
+		// Session 组装失败：回收刚申请的租约（有界 Revoke；失败由 TTL 兜底）
+		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, _ = l.cli.Revoke(rctx, grant.ID)
+		rcancel()
 		if ctx.Err() != nil { // #54：caller ctx 问题显式报错
 			return "", fmt.Errorf("etcdx distlock: new session: %w", err)
 		}

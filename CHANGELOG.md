@@ -5,8 +5,9 @@
 ## [Unreleased]
 
 - fix(registry): group/service/dataID/ip 拒绝 "/"，键层级边界成构造期/入口期不变量（#110）——Discover("s") 不再连带返回 "s/x" 的实例：键结构纯字符串拼接，段内 "/" 与层级分隔符不可区分，服务 "order/v2" 的实例键落进 "order" 的前缀扫描范围且被解码成 Service="order" 返回，流量被路由到另一个服务；dataID 含 "/" 时 (group="a", dataID="b/c") 与 (group="a/b", dataID="c") 同键串扰。修法：validateKeySegment 入口 fail-fast（注册/发现/订阅/配置四入口）+ 默认分组构造期校验 + 读侧「直接子键」防御（遗留嵌套键不并入实例集）
+- fix(distlock): 加锁建 Session 全程有界，Grant 黑洞不再永久挂死（#111）——concurrency.NewSession 内部 Grant 无 deadline，探测成功后、Grant 之前 etcd 进黑洞即永久阻塞，Lock 远超声明 timeout 不返回，caller ctx/timeout 与优雅降级面全部失效；修法为与预检同窗 3s 的显式 Grant + WithLease 组装 Session，创建全程有界，失败走既有 degradeOrFail 分类
 
-关联问题单：oekit/etcdx#110。
+关联问题单：oekit/etcdx#110、oekit/etcdx#111。
 
 ## [v0.2.11] — 2026-11-10
 
