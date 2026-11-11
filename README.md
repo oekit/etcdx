@@ -26,7 +26,7 @@ go get github.com/oekit/etcdx@v0.2.12
 |---|---|---|
 | `etcdx`（模块根包） | `github.com/oekit/etcdx` | `NewClient`（生产默认值：DialTimeout 5s、Endpoints 显式校验）、`NewClientFromConfig`（YAML 友好配置 + 构造即 Health）、`Health`（Member Status 任一端点可用即健康）、`Close(ctx)` 幂等关停 |
 | `registry` | `github.com/oekit/etcdx/registry` | `github.com/oekit/registry`（模块根）SPI 的 etcd 实现：`Registrar`（Lease KeepAlive 注册 + 丢约指数退避自动重注册）、`Discoverer`（prefix 拉取，按地址排序）、`Subscriber`（prefix Watch 推送，订阅即回调快照）、`ConfigStore`（KV Watch 配置监听）；键布局 `<prefix>/services/<group>/<service>/<ip:port>`，键路径段（group/service/dataID/ip）不得含 "/"——入口 fail-fast（#110） |
-| `distlock` | `github.com/oekit/etcdx/distlock` | `EtcdLocker`：每锁独占 Session（租约 + 自动续约，进程崩溃 TTL 兜底释放）、`concurrency.Mutex` revision 公平排队；`TryLock`/`Lock`/`Unlock` + `WithLock` 便捷包装；接口与 `redisx/distlock.Locker` 同形可直接互换；可选无 etcd 降级放行 |
+| `distlock` | `github.com/oekit/etcdx/distlock` | `EtcdLocker`：每锁独占 Session（租约 + 自动续约，进程崩溃 TTL 兜底释放）、`concurrency.Mutex` revision 公平排队；`TryLock`/`Lock`/`Unlock` + `WithLock` 便捷包装；实现 `pkg/distlock.Locker` 后端中立契约（#123 单源），与 `redisx/distlock` 可直接互换；可选无 etcd 降级放行 |
 
 ## 快速使用
 
@@ -56,11 +56,11 @@ _ = distlock.WithLock(ctx, locker, "deploy:user", 30*time.Second, 10*time.Second
 
 ### 与 redisx/distlock 互换
 
-`distlock.EtcdLocker` 与 `redisx/distlock` 的 `Locker` 接口方法签名完全一致：
-面向接口消费（如 `data/distlock` 门面）时，两种后端可直接替换，业务代码零改动。
-哨兵错误（`ErrLockNotAcquired`/`ErrLockTimeout`）同名但分属两仓——裸 `errors.Is`
-的跨包等价是单向的（etcdx 哨兵在错误链上时对同文案哨兵判 true）；「绑哪一侧的
-哨兵都能正确分类」请用 `distlock.IsOneOf(err, 哨兵)` 分类（#86/#112）。
+`distlock.EtcdLocker` 实现 `pkg/distlock.Locker` 后端中立契约（#123 契约单源，
+`Locker` 为其类型别名）：面向接口消费（如 `data/distlock` 门面）时，两种后端
+可直接替换，业务代码零改动。哨兵错误（`ErrLockNotAcquired`/`ErrLockTimeout`/
+`ErrLockNotHeld`，历史名 `ErrNotOwner`）是 `pkg/distlock` 契约哨兵的同值别名
+——errors.Is 判定不再有跨包身份分裂，历史 `IsOneOf` 补丁已随契约单源删除。
 
 ## 边界
 

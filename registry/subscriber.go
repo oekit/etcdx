@@ -105,71 +105,47 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 		snap := decodeAll(serviceName, s.opt.Group, dir, resp)
 		safeNotify(serviceName, func() { cb(snap) })
 
-		// 退避由**连续重建失败次数**派生（#85）：每轮快照重取失败 attempts++，
-		// 成功即归零——「重建成功」这个事实在结构上无法被忘记。旧实现把
-		// backoff 声明在循环外只增不减，成功重建后仍按累计值退避，几次抖动
-		// 后涨满 30s，此后任意一次瞬时中断都要吃满最长窗口才恢复推送，
-		// 韧性机制自身成了延迟源（实例下线最多 30s 才被订阅方看到）。
-		attempts := 0
-		rev := startRev
-		for h.ctx.Err() == nil {
-			wch := s.cli.Watch(h.ctx, dir, clientv3.WithPrefix(), clientv3.WithRev(rev))
-			canceled := false
-			for wresp := range wch {
-				if wresp.Canceled {
-					// Compacted 时 WithRev(startRev) 会被服务端取消——
-					// clientv3 不自动重建，必须自己重建
-					log.Warn("watch canceled, rebuilding with exponential backoff",
-						"service", serviceName, "err", wresp.Err())
-					canceled = true
-					break
-				}
+		// 观察循环骨架单源见 runWatchLoop（#122）：Canceled/通道关闭 → 指数
+		// 退避重建（重取快照 + 新 revision）→ 成功补投递一次快照。退避由
+		// 连续重建失败次数派生（#85），成功即归零。本侧差异点：事件批到达
+		// 后全量重拉实例（fetchInstances）再投递，取数窗口内被取代的过期
+		// 快照丢弃（#84）；cb panic 由 safeNotify 就地收编（#87），不炸穿
+		// 重建循环。
+		runWatchLoop(
+			h,
+			serviceName,
+			startRev,
+			func(ctx context.Context, rev int64) clientv3.WatchChan {
+				return s.cli.Watch(ctx, dir, clientv3.WithPrefix(), clientv3.WithRev(rev))
+			},
+			func(wresp clientv3.WatchResponse) {
 				if len(wresp.Events) == 0 {
-					continue
+					return
 				}
 				insts, err := fetchInstances(h.ctx, s.cli, s.opt.Prefix, s.opt.Group, serviceName)
 				if err != nil {
 					if h.ctx.Err() != nil {
-						return
+						return // 取数窗口内被退订：runWatchLoop 统一退出
 					}
 					log.Warn("refresh after watch event failed", "service", serviceName, "err", err)
-					continue
+					return
 				}
 				if h.superseded.Load() {
-					return // 已被新订阅/退订取代：过期投递一律丢弃（#84）
+					return // 取数窗口内被取代：过期快照丢弃（#84）
 				}
 				safeNotify(serviceName, func() { cb(insts) }) // cb panic 不终结循环（#87）
-			}
-			if h.ctx.Err() != nil {
-				return // Unsubscribe/Close：正常退出，不重建
-			}
-			if !canceled && wch != nil {
-				// 通道关闭且未见 Canceled（client 断连等）：同样走重建
-				log.Warn("watch channel closed, rebuilding", "service", serviceName)
-			}
-			// 退避等待（可被取消打断），重取快照拿新 revision，避免重建即 Compacted
-			select {
-			case <-h.ctx.Done():
-				return
-			case <-time.After(watchBackoff(attempts)):
-			}
-			resp, err := s.cli.Get(h.ctx, dir, clientv3.WithPrefix())
-			if err != nil {
-				attempts++
-				log.Warn("snapshot refresh for watch rebuild failed, retrying",
-					"service", serviceName, "err", err, "attempts", attempts)
-				continue // 快照失败：下轮再试（rev 不变，可能仍 Compacted，会再退避）
-			}
-			rev = resp.Header.Revision + 1
-			attempts = 0 // 重建成功：退避归零（#85），单次瞬时中断不吃历史累计窗口
-			if h.superseded.Load() {
-				return
-			}
-			// 重建成功前先回调一次快照（期间可能有实例变更，全量刷新一次视图）。
-			// cb panic 由 safeNotify 就地收编（#87）：重建循环自身不被回调炸穿。
-			snap := decodeAll(serviceName, s.opt.Group, dir, resp)
-			safeNotify(serviceName, func() { cb(snap) })
-		}
+			},
+			func(ctx context.Context) (int64, func(), error) {
+				resp, err := s.cli.Get(ctx, dir, clientv3.WithPrefix())
+				if err != nil {
+					return 0, nil, err
+				}
+				snap := decodeAll(serviceName, s.opt.Group, dir, resp)
+				return resp.Header.Revision + 1,
+					func() { safeNotify(serviceName, func() { cb(snap) }) },
+					nil
+			},
+		)
 	})
 	return nil
 }

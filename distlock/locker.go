@@ -15,6 +15,7 @@ import (
 
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
+	pkgdistlock "github.com/oekit/pkg/distlock"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
 	"google.golang.org/grpc/codes"
@@ -23,95 +24,49 @@ import (
 
 var log = logx.Delegating("etcdx.distlock")
 
-// sentinel 是本包三个错误哨兵的统一类型（#86）：可比较的值类型，同包内
-// errors.Is 按值身份匹配；同时实现 Is 方法做**同文案等价**判定——redisx/
-// distlock 历史上与本包各自 errors.New 出同名同文案的哨兵，是两个不同的值，
-// 跨包 errors.Is 恒 false，面向 Locker 接口的适配层换后端后错误分类随之
-// 漂移（429 变 500）。本类型让 etcdx 侧哨兵对文案相同的同义哨兵（redisx
-// 侧即普通 errors.New 同文案值）判定为 true：
-// errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) == true。
-// 该等价是**单向**的（#112）：判定挂在链头错误的 Is 方法上，只有 etcdx
-// 哨兵在错误链上才生效——redisx 侧哨兵是无 Is 方法的普通 errors.New 值，
-// errors.Is(redisx.ErrLockTimeout, etcdx.ErrLockTimeout) 走值比较恒 false，
-// 本包无法单侧修复（治本须 redisx 侧哨兵实现同款 Is 或双方共用同一值）。
-// 「绑哪一侧的哨兵都能正确分类」的双向入口是包级 [IsOneOf]。与
-// context.DeadlineExceeded 等无关错误仍为 false。代价：任何文案完全相同的
-// 外部错误也会被判 true——本包哨兵文案均带锁定语义、无前缀冲突，误判面
-// 可忽略。
-type sentinel struct{ msg string }
+// 哨兵错误集（#123 契约单源）：本包不再 errors.New 自有哨兵，包级变量
+// **别名指向 github.com/oekit/pkg/distlock 的契约哨兵**——同一进程只此
+// 一套值，errors.Is 跨包双向天然成立（errors.Is(etcdx.ErrLockTimeout,
+// redisx.ErrLockTimeout) 与反方向都为 true，前提是 redisx 侧同样迁移），
+// #86/#112 的 sentinel.Is 同文案等价与 IsOneOf 双向判定补丁随之失去存在
+// 必要，已删除。
+var (
+	// ErrLockNotAcquired 表示锁被其他持有者占用，获取失败（TryLock 单次
+	// 未抢到，不是通信故障）。
+	ErrLockNotAcquired = pkgdistlock.ErrLockNotAcquired
 
-func (e sentinel) Error() string { return e.msg }
+	// ErrLockTimeout 表示在指定超时时间内未能获取锁。
+	ErrLockTimeout = pkgdistlock.ErrLockTimeout
 
-// Is 支持 errors.Is 的 target 判定：同类型按值比较（== 已覆盖），外部
-// 同文案错误（含 redisx/distlock 的同名哨兵）视为同一语义错误（#86）。
-// 注意这只是「etcdx 哨兵在链上」方向；反方向见 [IsOneOf]（#112）。
-func (e sentinel) Is(target error) bool {
-	if target == nil {
-		return false
-	}
-	return target.Error() == e.msg
-}
+	// ErrLockNotHeld 表示 Unlock 时锁不存在或已易主——本次 Unlock **没有
+	// 删除任何锁**（调用方不得继续假装持有）。契约名与 pkg/distlock、
+	// redisx/distlock 对齐。
+	ErrLockNotHeld = pkgdistlock.ErrLockNotHeld
 
-// IsOneOf 判定 err 是否等价于 targets 中的任一错误哨兵，使「绑哪一侧的
-// 哨兵都能正确分类」**双向**成立（#112）：errors.Is 的跨包等价挂在链头
-// 错误的 Is 方法上，redisx/distlock 的哨兵是无 Is 方法的普通 errors.New
-// 值——errors.Is(redisx.ErrLockTimeout, ErrLockTimeout) 走值比较恒 false，
-// 适配层绑本包哨兵、后端跑 redisx 时正常超时被误分类成 500（#86 承诺的
-// 反方向缺口）。本函数在 errors.Is 之外追加**链上同文案**判定：逐层
-// Unwrap，链上任何一层的文案与 target 一致即视为同一语义错误——与
-// sentinel.Is 的同文案口径一致（#86），wrap 链上的 redisx 哨兵也能命中。
+	// ErrNotOwner 是 [ErrLockNotHeld] 的历史名（#123 哨兵映射）：本包历史
+	// 哨兵文案 "lock not owned by this owner" 与 redisx 侧同语义哨兵文案
+	// 不同（"lock not held by this owner"），是 #86/#112 补丁的根源之一。
+	// 契约单源后统一映射到 pkg 的 ErrLockNotHeld——**对外文案随之变为
+	// "lock not held by this owner"**（changelog BREAKING 注记），值身份
+	// 与 ErrLockNotHeld / pkg/distlock.ErrLockNotHeld 完全一致。
+	ErrNotOwner = pkgdistlock.ErrLockNotHeld
+)
+
+// Locker 是分布式锁接口（#123 契约单源）：**类型别名**指向
+// github.com/oekit/pkg/distlock.Locker（TryLock/Lock/Unlock 三方法 +
+// 哨兵契约，见该包文档）——etcdx 与 redisx 的 Locker 是同一个类型，
+// 两个后端的实现可直接互换，业务代码面向本接口或 pkg/distlock.Locker
+// 编程完全等价。
 //
-// 用法（适配层无论绑哪侧哨兵，分类都正确）：
+// 本后端的行为口径（契约层只定形状与哨兵；「方法集同形」之外的行为差异
+// 逐条列明，不再宣称无条件的「换实现不改变行为」，#86）：
 //
-//	if distlock.IsOneOf(err, distlock.ErrLockTimeout) { /* 429 / 不重试 */ }
-//	if distlock.IsOneOf(err, redisxdistlock.ErrLockTimeout) { /* 同上 */ }
-//
-// 与 sentinel.Is 相同的代价：任何文案完全相同的外部错误也会判 true——
-// 哨兵文案均带锁定语义、无前缀冲突，误判面可忽略。
-func IsOneOf(err error, targets ...error) bool {
-	if err == nil || len(targets) == 0 {
-		return false
-	}
-	for _, target := range targets {
-		if target == nil {
-			continue
-		}
-		if errors.Is(err, target) {
-			return true
-		}
-		for e := err; e != nil; e = errors.Unwrap(e) {
-			if e.Error() == target.Error() {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// ErrLockNotAcquired 表示锁被其他持有者占用，获取失败。
-var ErrLockNotAcquired = sentinel{msg: "lock not acquired"}
-
-// ErrLockTimeout 表示在指定超时时间内未能获取锁。
-var ErrLockTimeout = sentinel{msg: "lock acquire timeout"}
-
-// ErrNotOwner 表示 Unlock 的 ownerID 与本进程持有记录不符（或该 key 未由本进程持有）。
-var ErrNotOwner = sentinel{msg: "lock not owned by this owner"}
-
-// Locker 是分布式锁接口，与 redisx/distlock.Locker 方法集同形，面向接口编程。
-//
-// 两后端的统一口径（跨后端移植按此理解；「方法集同形」之外的行为差异逐条
-// 列明，不再宣称无条件的「换实现不改变行为」，#86）：
-//
-//   - 错误哨兵跨后端兼容（#86/#112）：本包哨兵对同文案错误等价判定，
-//     errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) 为 true（etcdx
-//     哨兵在错误链上时）。**反方向**裸 errors.Is 仍为 false（#112：redisx
-//     侧哨兵是无 Is 方法的普通 errors.New 值，本包无法单侧修复）——「绑哪
-//     一侧的哨兵都能正确分类」的双向入口是 [IsOneOf]：适配层绑本包哨兵跑
-//     在 redisx 上（或反向）都用 IsOneOf 分类，错误分类不漂移。ErrNotOwner
-//     与 redisx 侧的「非本人锁」哨兵文案不同，不参与跨包等价。
-//   - Unlock 非持有者**显式报错**：本包返回 ErrNotOwner；redisx 自其对齐
-//     修复（其 #115）起同样对非持有者显式报错而非静默 no-op——静默会让
-//     「锁没放掉」不可观测，调用方误以为已释放。
+//   - 哨兵即 pkg/distlock 哨兵（同值别名）：ErrLockNotAcquired /
+//     ErrLockTimeout / ErrNotOwner(=ErrLockNotHeld) 与 redisx 侧（迁移后）
+//     同一套值，errors.Is 判定不再有跨包身份分裂。
+//   - Unlock 非持有者**显式报错**：返回 ErrLockNotHeld（历史名 ErrNotOwner）；
+//     redisx 自其对齐修复（其 #115）起同样对非持有者显式报错而非静默
+//     no-op——静默会让「锁没放掉」不可观测，调用方误以为已释放。
 //   - ttl 必须为正：ttl≤0 直接报错（与 redisx 的 "ttl must be positive"
 //     对齐，#62）——此前 etcdx 把零值/负值静默抬成 1s，同一份代码换后端
 //     一个立刻报错、一个悄悄持 1s 锁。etcd 租约秒级精度，(0, 1s) 的亚秒
@@ -125,22 +80,7 @@ var ErrNotOwner = sentinel{msg: "lock not owned by this owner"}
 //     场景，对应放行面为「运行期 etcd 传输层不可达」。除该面外的一切
 //     错误（权限/认证/参数/压缩/未知业务错）两后端都显式报错，绝不
 //     fail-open。
-type Locker interface {
-	// TryLock 非阻塞尝试获取锁。
-	// 返回 (ownerID, nil) 表示成功，ownerID 用于后续 Unlock。
-	// 返回 ("", ErrLockNotAcquired) 表示锁被占用。
-	// ttl≤0 直接报错（见接口注释统一口径）。
-	TryLock(ctx context.Context, key string, ttl time.Duration) (string, error)
-
-	// Lock 阻塞获取锁，带超时。
-	// 返回 (ownerID, nil) 表示成功。
-	// 返回 ("", ErrLockTimeout) 表示超时未获取到。
-	// timeout≤0 为单次非阻塞尝试（见接口注释统一口径）：成功或 ErrLockTimeout。
-	Lock(ctx context.Context, key string, ttl time.Duration, timeout time.Duration) (string, error)
-
-	// Unlock 释放锁，ownerID 必须匹配。
-	Unlock(ctx context.Context, key string, ownerID string) error
-}
+type Locker = pkgdistlock.Locker
 
 const defaultPrefix = "/oekit/distlock"
 
@@ -306,8 +246,25 @@ func (l *EtcdLocker) Lock(ctx context.Context, key string, ttl, timeout time.Dur
 	})
 }
 
+// stageFailed 统一加锁链路各阶段（连接预检/Grant/建 Session）失败的分类与
+// 路由（#124 单源，判别口径为 #54）：caller ctx 自身取消/超时 ≠ etcd 不可达
+// ——前者显式报错不降级（此前把 caller deadline 误标为 etcd unreachable 后
+// 降级放行：多实例同时「拿到锁」并发进临界区，互斥直接失效），后者进
+// [EtcdLocker.degradeOrFail]（降级面只对「etcd 传输层不可达」放行，#63）。
+// stage 进入 caller-ctx 错误文案定位环节（probing etcd / granting lease /
+// creating session）；stageErr 为该阶段的原始失败（含各阶段既有文案包装），
+// 降级/显式报错路径原样透传。
+func (l *EtcdLocker) stageFailed(ctx context.Context, key, stage string, stageErr error) (string, error) {
+	if ctx.Err() != nil {
+		l.notify(key, false, ctx.Err())
+		return "", fmt.Errorf("etcdx distlock: caller context done while %s: %w", stage, ctx.Err())
+	}
+	return l.degradeOrFail(key, stageErr)
+}
+
 // acquire 统一加锁流程：连接预检 → 建 Session → 建 Mutex → 执行具体加锁
-// 策略 → 记录持有。加锁失败一律关闭 Session 回收租约。
+// 策略 → 记录持有。加锁失败一律关闭 Session 回收租约。阶段失败统一经
+// [EtcdLocker.stageFailed] 分类路由（#124）。
 func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	do func(ctx context.Context, m *concurrency.Mutex) error) (string, error) {
 	if key == "" {
@@ -321,20 +278,13 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 		return "", fmt.Errorf("etcdx distlock: ttl must be positive, got %v", ttl)
 	}
 	// 连接预检：轻量读在有界窗口内探活，失败直接降级/报错，不做后续网络
-	// 交互（#54：caller ctx 自身取消/超时 ≠ etcd 不可达，显式报错不降级）
+	// 交互（#54 判别见 stageFailed）
 	pctx, pcancel := context.WithTimeout(ctx, connProbeWindow)
 	_, perr := l.cli.Get(pctx, l.prefix)
 	pcancel()
 	if perr != nil {
-		// #54：调用方 ctx 自身取消/超时 ≠ etcd 不可达——降级面只对
-		// 「etcd 传输层不可用」放行，caller ctx 问题显式报错。此前把 caller
-		// deadline 误标为 etcd unreachable 后降级放行：多实例同时「拿到锁」
-		// 并发进临界区，互斥直接失效。
-		if ctx.Err() != nil {
-			l.notify(key, false, ctx.Err())
-			return "", fmt.Errorf("etcdx distlock: caller context done while probing etcd: %w", ctx.Err())
-		}
-		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: etcd unreachable: %w", perr))
+		return l.stageFailed(ctx, key, "probing etcd",
+			fmt.Errorf("etcdx distlock: etcd unreachable: %w", perr))
 	}
 	// 租约精度：etcd 的租约以**秒**为单位 ⇒ (0, 1s) 的亚秒 TTL 抬升至 1s。
 	// （redisx 侧走 SetNX 是精确毫秒 ⇒ 同一个 Locker 接口，200ms 的锁在
@@ -359,30 +309,22 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	grant, gerr := l.cli.Grant(gctx, int64(ttlSec))
 	gcancel()
 	if gerr != nil {
-		// 与预检同口径（#54）：caller ctx 自身取消/超时 ≠ etcd 不可达
-		if ctx.Err() != nil {
-			l.notify(key, false, ctx.Err())
-			return "", fmt.Errorf("etcdx distlock: caller context done while granting lease: %w", ctx.Err())
-		}
-		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: grant lease: %w", gerr))
+		return l.stageFailed(ctx, key, "granting lease",
+			fmt.Errorf("etcdx distlock: grant lease: %w", gerr))
 	}
 	session, err := concurrency.NewSession(l.cli, concurrency.WithLease(grant.ID), concurrency.WithTTL(ttlSec))
 	if err != nil {
-		if ctx.Err() != nil { // #54：caller ctx 问题显式报错
-			return "", fmt.Errorf("etcdx distlock: new session: %w", err)
-		}
-		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: new session: %w", err))
+		return l.stageFailed(ctx, key, "creating session",
+			fmt.Errorf("etcdx distlock: new session: %w", err))
 	}
 	m := concurrency.NewMutex(session, l.lockKey(key))
 	if err := do(ctx, m); err != nil {
 		_ = session.Close()
+		// 哨兵错误（busy/timeout）与 caller ctx 取消/超时已是明确分类：
+		// 原样上抛不再包装（#54 同口径——caller ctx 问题不进降级面）
 		if errors.Is(err, ErrLockNotAcquired) || errors.Is(err, ErrLockTimeout) || ctx.Err() != nil {
 			l.notify(key, false, err)
 			return "", err
-		}
-		// #54 同口径：caller ctx 已取消/超时的错误不进降级面
-		if ctx.Err() != nil {
-			return "", fmt.Errorf("etcdx distlock: lock %s: %w", key, err)
 		}
 		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: lock %s: %w", key, err))
 	}

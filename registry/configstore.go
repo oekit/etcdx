@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/oekit/concurrency/async"
 	regcore "github.com/oekit/registry"
@@ -117,10 +116,6 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 	c.mu.Unlock()
 
 	async.GoSafe(func() {
-		// 观察循环（#55）：Canceled（ErrCompacted 等）/通道关闭后指数退避重建
-		//（重读当前值拿新 revision + 立即回调一次最新内容）——对齐订阅侧的
-		// 自动重建韧性；此前只 Warn 一条就 return，配置推送几天后无声停更。
-		//
 		// #84：投递前先等被替换的旧 goroutine 退出（回调不可能并发），之后
 		// 所有投递前检查 superseded，被取代/停听后的过期内容一律丢弃。
 		defer h.close()
@@ -135,69 +130,47 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 			return
 		}
 
-		// 退避由**连续重建失败次数**派生（#85，与订阅侧同口径）：每轮快照
-		// 重取失败 attempts++，成功即归零。旧实现 backoff 声明在循环外只增
-		// 不减，几次抖动后涨满 30s，此后任意一次瞬时中断都要吃满最长窗口
-		// 才恢复推送，配置热更新最多延迟 30s。
-		attempts := 0
-		rev := startRev
-		for h.ctx.Err() == nil {
-			wch := c.cli.Watch(h.ctx, key, clientv3.WithRev(rev))
-			canceled := false
-			for wresp := range wch {
-				if wresp.Canceled {
-					log.Warn("config watch canceled, rebuilding with exponential backoff",
-						"dataID", dataID, "err", wresp.Err())
-					canceled = true
-					break
-				}
-				if h.superseded.Load() {
-					return // 已被新监听/停听取代：过期投递一律丢弃（#84）
-				}
+		// 观察循环骨架单源见 runWatchLoop（#122）：Canceled（ErrCompacted 等）/
+		// 通道关闭后指数退避重建（重读当前值拿新 revision + 立即回调一次最新
+		// 内容）；退避由连续重建失败次数派生（#85），成功即归零。本侧差异点：
+		// 事件逐条回调新值/删除空串；重建补投递回调当前值——键已被删除时
+		// 回调空串，与 Delete 事件语义一致（#83）——「键已删除」在重建路径上
+		// 必须可表达：删除事件随被取消的 watch 一起丢失后，消费方永久持有
+		// 已删配置且无后续事件可纠正。onChange panic 由 safeNotify 就地收编
+		// （#87），不炸穿重建循环。
+		runWatchLoop(
+			h,
+			dataID,
+			startRev,
+			func(ctx context.Context, rev int64) clientv3.WatchChan {
+				return c.cli.Watch(ctx, key, clientv3.WithRev(rev))
+			},
+			func(wresp clientv3.WatchResponse) {
 				for _, ev := range wresp.Events {
 					if ev.Type == clientv3.EventTypeDelete {
 						safeNotify(dataID, func() { onChange("") }) // onChange panic 不终结循环（#87）
 					} else {
-						safeNotify(dataID, func() { onChange(string(ev.Kv.Value)) })
+						safeNotify(dataID, func() { onChange(string(ev.Kv.Value)) }) // #87
 					}
 				}
-			}
-			if h.ctx.Err() != nil {
-				return // StopListenConfig：正常退出
-			}
-			if !canceled {
-				log.Warn("config watch channel closed, rebuilding", "dataID", dataID)
-			}
-			select {
-			case <-h.ctx.Done():
-				return
-			case <-time.After(watchBackoff(attempts)):
-			}
-			resp, err := c.cli.Get(h.ctx, key, clientv3.WithKeysOnly())
-			if err != nil {
-				attempts++
-				log.Warn("config snapshot refresh for rebuild failed, retrying",
-					"dataID", dataID, "err", err, "attempts", attempts)
-				continue
-			}
-			rev = resp.Header.Revision + 1
-			attempts = 0 // 重建成功：退避归零（#85），单次瞬时中断不吃历史累计窗口
-			if h.superseded.Load() {
-				return
-			}
-			// 重建后立即回调一次当前值（重建窗口内的变更不丢视图）。键已被
-			// 删除时回调空串，与上方 Delete 事件语义一致（#83）——旧实现
-			// 跳过空结果，「键已删除」在重建路径上无从表达：删除事件随被
-			// 取消的 watch 一起丢失后，消费方永久持有已删配置且无后续事件
-			// 可纠正。
-			if val, gerr := c.cli.Get(h.ctx, key); gerr == nil {
-				if len(val.Kvs) > 0 {
-					safeNotify(dataID, func() { onChange(string(val.Kvs[0].Value)) }) // #87
-				} else {
-					safeNotify(dataID, func() { onChange("") }) // #87
+			},
+			func(ctx context.Context) (int64, func(), error) {
+				resp, err := c.cli.Get(ctx, key, clientv3.WithKeysOnly())
+				if err != nil {
+					return 0, nil, err
 				}
-			}
-		}
+				return resp.Header.Revision + 1, func() {
+					// 重建后立即回调一次当前值（重建窗口内的变更不丢视图）。
+					if val, gerr := c.cli.Get(ctx, key); gerr == nil {
+						if len(val.Kvs) > 0 {
+							safeNotify(dataID, func() { onChange(string(val.Kvs[0].Value)) }) // #87
+						} else {
+							safeNotify(dataID, func() { onChange("") }) // #87
+						}
+					}
+				}, nil
+			},
+		)
 	})
 	return nil
 }
