@@ -1,19 +1,19 @@
-// Package distlock 提供基于 etcd 的分布式锁，方法集与
-// github.com/oekit/redisx/distlock.Locker 完全一致（TryLock/Lock/Unlock +
-// ownerID 语义），Go 结构化类型下两种后端可直接互换，业务代码面向
-// Locker 接口编程即可。
+// Package distlock 提供基于 etcd 的分布式锁，实现
+// github.com/oekit/pkg/distlock.Locker 后端中立契约（TryLock/Lock/Unlock +
+// ownerID 语义，#123 契约单源），与 redisx/distlock 后端（迁移后）同类型
+// 可互换，业务代码面向 Locker 接口编程即可。
 //
-// # 跨后端错误面（#86/#112）
+// # 跨后端错误面（#123 单源后）
 //
-// 错误哨兵跨后端等价判定：本包哨兵对**同文案**错误等价，etcdx 哨兵在错误
-// 链上时 errors.Is(etcdx.ErrLockTimeout, redisx.ErrLockTimeout) 为 true。
-// 注意裸 errors.Is 的跨包等价是**单向**的（#112：redisx 侧哨兵是无 Is 方法
-// 的普通 errors.New 值，反方向走值比较恒 false，本包无法单侧修复）——
-// 「绑哪一侧的哨兵都能正确分类」的双向入口是 [IsOneOf]，适配层无论绑哪侧
-// 哨兵都用它分类，「锁被占用」「获取超时」的错误分类不漂移。Unlock 对非
-// 持有者显式报 ErrNotOwner（redisx 侧同样在其 #115 对齐为显式报错），两侧
-// 不再一边静默一边报错。机制级差异（亚秒 TTL 精度、降级放行面）见 Locker
-// 接口注释的统一口径。
+// 错误哨兵即 pkg/distlock 的契约哨兵（同值别名）：ErrLockNotAcquired /
+// ErrLockTimeout / ErrLockNotHeld（历史名 [ErrNotOwner]）——同一进程只此
+// 一套值，适配层绑哪一侧哨兵做 errors.Is 分类都不漂移（429 不再变 500），
+// 历史 #86/#112 的 sentinel.Is 同文案等价与 IsOneOf 双向判定补丁已随契约
+// 单源删除。文案映射注意：ErrNotOwner 历史文案是 "lock not owned by this
+// owner"，契约单源后统一为 pkg 哨兵文案 "lock not held by this owner"
+// （对外文案变化，见 changelog）。Unlock 对非持有者显式报 ErrLockNotHeld
+// （redisx 侧同样在其 #115 对齐为显式报错），两侧不再一边静默一边报错。
+// 机制级差异（亚秒 TTL 精度、降级放行面）见 Locker 类型注释的统一口径。
 //
 // # 实现机制
 //
