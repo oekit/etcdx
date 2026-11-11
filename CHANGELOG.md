@@ -2,6 +2,14 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.3.0] — 2026-11-12
+
+- refactor(distlock)【BREAKING】: distlock 契约单源落地（etcdx#123，消费 github.com/oekit/pkg v0.45.0 的 distlock 后端中立契约）——Locker 改为 pkg/distlock.Locker 类型别名，EtcdLocker 直接满足契约；哨兵改 pkg 同值别名（ErrLockNotAcquired/ErrLockTimeout，新增契约名 ErrLockNotHeld）。**BREAKING**：ErrNotOwner 对外文案由 "lock not owned by this owner" 变为 "lock not held by this owner"（映射 pkg 契约哨兵，值身份不变、errors.Is 判定不受影响，历史名保留）；删除 sentinel.Is/IsOneOf 双向文案匹配机制（grep 全工作区无外部消费方，哨兵单源后裸 errors.Is 即正确分类，429/500 不再漂移）| refactor(distlock)【BREAKING】: WithLock 删本地实现改薄委托 pkg/distlock.WithLock 单源（etcdx#123）——释放纪律统一为 context.WithoutCancel 口径（原 WithTimeout(Background, 3s)：不携带 caller ctx 取值 + 3s 魔法常数；现释放 ctx 与 caller 取消状态解耦且取值原样保留）；获取失败错误统一带 "lock <key>:" 前缀包装、哨兵经 %w 穿透（原实现无包装，与 redisx 口径对齐）| refactor(registry): Subscriber.Subscribe 与 ConfigStore.ListenConfig 复制的 watch 重建循环骨架提取为 runWatchLoop 单源（etcdx#122）——#55 Canceled/断连重建、#84 superseded 丢弃、#85 退避成功归零只实现一份，差异点（watch 目标/事件投递形态/快照重取补投递）闭包注入；日志统一 target 字段（原 service/dataID）| refactor(distlock): EtcdLocker.acquire 的 caller-ctx 判别与 notify/degradeOrFail 路由提取 stageFailed 单源（etcdx#124）——#54 caller-ctx ≠ etcd 不可达口径不变，acquire 主体缩至约 50 行；建 Session 阶段 caller-ctx 失败补 notify（原实现该分支漏回调，与其他阶段对齐）| build: 依赖地板——pkg v0.42.0→v0.45.0（indirect→direct，契约消费）、logx v0.9.2→v0.10.0、registry v0.5.14→v0.5.15（发版前 floor sync）
+
+关联问题单：etcdx#122、etcdx#123、etcdx#124。
+
+关联问题单：etcdx#122、etcdx#123、etcdx#124。
+
 ## [v0.2.12] — 2026-11-11
 
 - fix(registry): 键路径段（group/service/dataID/ip）含 "/" 入口 fail-fast + 前缀扫描过滤段数不吻合的既有脏键（#110）——service "order/v2" 的实例键落在 "order/" 前缀之下，Discover("order") 连带返回 order/v2 的实例并解码成 Service="order"，流量被路由到另一个服务且全程无报错；configKey 同构（group "g/a"+dataID "b" 与 group "g"+dataID "a/b" 拼出同一个键，跨 group 串扰）。注册/发现/订阅/配置入口把「键层级边界」变成构造期不变量；键布局不变，既有干净键完全兼容
