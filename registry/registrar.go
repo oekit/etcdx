@@ -96,7 +96,7 @@ func (r *Registrar) Register(ctx context.Context, inst regcore.Instance) error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		return fmt.Errorf("etcdx registry: registrar closed")
+		return ErrRegistrarClosed
 	}
 	old := r.regs[key]
 	delete(r.regs, key)
@@ -117,8 +117,15 @@ func (r *Registrar) Register(ctx context.Context, inst regcore.Instance) error {
 		r.mu.Unlock()
 		cancel()
 		close(reg.done)
-		_, _ = r.cli.Revoke(ctx, leaseID)
-		return fmt.Errorf("etcdx registry: registrar closed")
+		// 二次落闸竞态（Register 做网络 I/O 期间 Close 完成）：撤销刚写出的
+		// 租约。Revoke 失败不再 `_, _` 吞错（仓规「所有 error 禁止 _ 忽略」，
+		// #126）——记 Warn 留可观测痕迹；租约由 TTL 兜底自动过期、键随之
+		// 删除，不会永久残留（与 distlock 侧 session.Close 回滚路径同口径）。
+		if _, err := r.cli.Revoke(ctx, leaseID); err != nil {
+			log.Warn("revoke lease after closed race failed, left to TTL reap",
+				"key", key, "lease", leaseID, logx.ErrKey, err)
+		}
+		return ErrRegistrarClosed
 	}
 	r.regs[key] = reg
 	r.mu.Unlock()
@@ -195,7 +202,13 @@ func (r *Registrar) putWithLease(ctx context.Context, key, val string) (clientv3
 		return clientv3.NoLease, fmt.Errorf("etcdx registry: grant lease: %w", err)
 	}
 	if _, err := r.cli.Put(ctx, key, val, clientv3.WithLease(grant.ID)); err != nil {
-		_, _ = r.cli.Revoke(ctx, grant.ID)
+		// 回滚刚申请的租约：Revoke 失败不再 `_, _` 吞错（#126，同仓内
+		// distlock/registry 两条回滚路径的统一口径）——Warn 留可观测痕迹；
+		// 租约由 TTL 兜底自动过期，不会永久残留。
+		if _, rerr := r.cli.Revoke(ctx, grant.ID); rerr != nil {
+			log.Warn("revoke lease after put failed, left to TTL reap",
+				"key", key, "lease", grant.ID, logx.ErrKey, rerr)
+		}
 		return clientv3.NoLease, fmt.Errorf("etcdx registry: put %s: %w", key, err)
 	}
 	return grant.ID, nil
@@ -208,7 +221,7 @@ func (r *Registrar) supervise(ctx context.Context, key, val string, reg *registr
 	for {
 		ch, err := r.cli.KeepAlive(ctx, reg.lease())
 		if err != nil {
-			log.Warn("keepalive start failed", "key", key, "err", err)
+			log.Warn("keepalive start failed", "key", key, logx.ErrKey, err)
 		} else {
 			for range ch { //nolint:revive // 仅排空响应，通道关闭即退出
 			}
@@ -235,7 +248,7 @@ func (r *Registrar) reRegister(ctx context.Context, key, val string, reg *regist
 			log.Info("instance re-registered", "key", key, "lease", id)
 			return true
 		}
-		log.Warn("re-register failed, will retry", "key", key, "backoff", backoff, "err", err)
+		log.Warn("re-register failed, will retry", "key", key, "backoff", backoff, logx.ErrKey, err)
 		select {
 		case <-ctx.Done():
 			return false
