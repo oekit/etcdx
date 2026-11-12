@@ -25,9 +25,13 @@ type fakeLocker struct {
 	unlockKey string          // Unlock 收到的 key
 	unlockOwn string          // Unlock 收到的 ownerID
 	unlockCtx context.Context // Unlock 收到的 ctx（验证 WithoutCancel 纪律）
-	unlocked  chan struct{}
-	lockCalls int
-	fnRan     bool
+	// #428 口径（pkg v0.47.0）：解耦判定点在 Unlock 调用时——ReleaseUncancelable
+	// 的 defer cancel 会让事后 Err() 恒 Canceled；释放 ctx 必须带 deadline。
+	unlockCtxErrAtCall  error
+	unlockCtxDeadlineOK bool
+	unlocked            chan struct{}
+	lockCalls           int
+	fnRan               bool
 }
 
 func newFakeLocker() *fakeLocker {
@@ -54,6 +58,8 @@ func (f *fakeLocker) Lock(_ context.Context, _ string, _, _ time.Duration) (stri
 func (f *fakeLocker) Unlock(ctx context.Context, key, ownerID string) error {
 	f.mu.Lock()
 	f.unlockCtx = ctx
+	f.unlockCtxErrAtCall = ctx.Err()
+	_, f.unlockCtxDeadlineOK = ctx.Deadline()
 	f.unlockKey = key
 	f.unlockOwn = ownerID
 	f.mu.Unlock()
@@ -172,8 +178,11 @@ func TestWithLock_ReleasedWithUncancelableContext(t *testing.T) {
 	if fl.unlockCtx == nil {
 		t.Fatal("Unlock 未被调用")
 	}
-	if err := fl.unlockCtx.Err(); err != nil {
-		t.Fatalf("释放用的 ctx 必须与 caller 取消状态解耦, got %v", err)
+	if fl.unlockCtxErrAtCall != nil {
+		t.Fatalf("释放用的 ctx 在调用点必须与 caller 取消状态解耦, got %v", fl.unlockCtxErrAtCall)
+	}
+	if !fl.unlockCtxDeadlineOK {
+		t.Fatal("释放 ctx 必须带 deadline（pkg#428：释放动作有上界）")
 	}
 	// ctx 携带的取值保留（WithoutCancel 只剥离取消信号，不换 context 链；
 	// 历史 WithTimeout(Background, 3s) 口径会丢掉取值——行为差异点）。
@@ -192,7 +201,10 @@ func TestWithLock_ReleasedWithUncancelableContext_NoCallerCancel(t *testing.T) {
 		t.Fatalf("WithLock 应成功, got %v", err)
 	}
 	<-fl.unlocked
-	if fl.unlockCtx.Err() != nil {
-		t.Fatalf("未取消场景释放 ctx 不应带错误, got %v", fl.unlockCtx.Err())
+	if fl.unlockCtxErrAtCall != nil {
+		t.Fatalf("未取消场景释放 ctx 调用点不应带错误, got %v", fl.unlockCtxErrAtCall)
+	}
+	if !fl.unlockCtxDeadlineOK {
+		t.Fatal("释放 ctx 必须带 deadline（pkg#428：释放动作有上界）")
 	}
 }
