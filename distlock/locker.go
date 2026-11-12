@@ -16,10 +16,13 @@ import (
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
 	pkgdistlock "github.com/oekit/pkg/distlock"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/oekit/etcdx/internal/keyseg"
 )
 
 var log = logx.Delegating("etcdx.distlock")
@@ -270,6 +273,14 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	if key == "" {
 		return "", fmt.Errorf("etcdx distlock: key is empty")
 	}
+	// 键层级边界校验（#138，规则单源见 internal/keyseg）：锁键经 lockKey
+	// 直接拼进 etcd 分层键空间，concurrency.Mutex 的互斥判定用前缀范围查询
+	// （WithFirstCreate）——键含 "/" 时 "a/b" 的 owner 键落在 "a" 的互斥前缀
+	// 之内，持有 "a/b" 则 "a" 永远拿不到锁（单向过度互斥，与 registry 侧
+	// #110 的同类约定对齐）。参数错误在任何网络交互前 fail-fast。
+	if err := keyseg.Check("lock key", key); err != nil {
+		return "", fmt.Errorf("etcdx distlock: %w", err)
+	}
 	// ttl≤0 与 redisx 对齐直接报错（#62）：同接口下 redisx 的 TryLock 对
 	// ttl≤0 返回 "distlock: ttl must be positive"；此前这里静默抬成 1s——
 	// 同一份调用代码换后端，一个是立刻报错、一个是悄悄持 1s 锁。零值/负值
@@ -319,7 +330,13 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	}
 	m := concurrency.NewMutex(session, l.lockKey(key))
 	if err := do(ctx, m); err != nil {
-		_ = session.Close()
+		// 加锁失败回滚：关闭 Session 撤销刚申请的租约。Close 失败不吞错
+		// （仓规「所有 error 禁止 _ 忽略」，#126）——记 Warn 留可观测痕迹；
+		// 租约本身由 TTL 兜底自动过期（等待者键随租约删除），不会永久占用。
+		if cerr := session.Close(); cerr != nil {
+			log.Warn("session close after failed acquire left lease to TTL reap",
+				"key", key, logx.ErrKey, cerr)
+		}
 		// 哨兵错误（busy/timeout）与 caller ctx 取消/超时已是明确分类：
 		// 原样上抛不再包装（#54 同口径——caller ctx 问题不进降级面）
 		if errors.Is(err, ErrLockNotAcquired) || errors.Is(err, ErrLockTimeout) || ctx.Err() != nil {
@@ -442,6 +459,16 @@ func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error
 	if cerr := h.session.Close(); cerr != nil && err == nil {
 		err = fmt.Errorf("etcdx distlock: close session %s: %w", key, cerr)
 	}
+	// #137：契约（pkg/distlock.Locker.Unlock）——「锁不存在或已易主（陈旧
+	// 持有者解锁）返回 ErrLockNotHeld；其它 error 为后端通信故障」。陈旧
+	// 持有者（租约失效后被他人重新拿锁）在 etcd 侧的表象：Mutex.Unlock 删
+	// 的键早已随租约消失（Delete 幂等成功，无错误），Session.Close 的
+	// Revoke 返回 ErrLeaseNotFound——此前该原始 etcd 错误直出，恰好顶替了
+	// 契约点名的「锁已易主」哨兵，调用方无法用 errors.Is 判定「我已不再
+	// 持有」。这里把它翻译成契约哨兵（规则单源见 pkg/distlock 契约原文）。
+	if err != nil && errors.Is(err, rpctypes.ErrLeaseNotFound) {
+		return fmt.Errorf("etcdx distlock: unlock %s: %w", key, ErrLockNotHeld)
+	}
 	return err
 }
 
@@ -455,7 +482,7 @@ func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error
 // 明确的连接不可达才降级，口径写进 Locker 接口注释。
 func (l *EtcdLocker) degradeOrFail(key string, err error) (string, error) {
 	if l.gracefulDegradation && isUnreachable(err) {
-		log.Warn("etcd unreachable, lock degraded to pass-through", "key", key, "err", err)
+		log.Warn("etcd unreachable, lock degraded to pass-through", "key", key, logx.ErrKey, err)
 		ownerID := "degraded:" + newOwnerID()
 		l.mu.Lock()
 		l.setHeld(key, ownerID, &heldLock{ownerID: ownerID})
