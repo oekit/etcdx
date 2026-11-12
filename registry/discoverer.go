@@ -1,9 +1,10 @@
 package registry
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 
 	regcore "github.com/oekit/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -79,6 +80,6 @@ func fetchInstances(ctx context.Context, cli *clientv3.Client, prefix, group, se
 		}
 		out = append(out, inst)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Addr() < out[j].Addr() })
+	slices.SortFunc(out, func(a, b regcore.Instance) int { return cmp.Compare(a.Addr(), b.Addr()) })
 	return out, nil
 }
