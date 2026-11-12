@@ -48,10 +48,20 @@ func decodeInstance(service, group string, b []byte) (regcore.Instance, error) {
 	if err := json.Unmarshal(b, &v); err != nil {
 		return regcore.Instance{}, fmt.Errorf("etcdx registry: decode instance: %w", err)
 	}
-	return regcore.Instance{
+	inst := regcore.Instance{
 		Service: service, IP: v.IP, Port: v.Port, Weight: v.Weight,
 		Metadata: v.Metadata, Group: group, Cluster: v.Cluster,
-	}, nil
+	}
+	// 解码侧语义复检（#148）：与 Register 入口 validateInstance 同判据单源。
+	// etcd 是共享键空间，绕过 Register 的写入方（运维脚本、外部客户端、历史
+	// 遗留值）可能留下 IP 空、port 越界的脏值——「写入被拒、读出放行」的两侧
+	// 口径不一致会让 ":0"/越界端口原样进入 Discover/Subscribe 参与负载均衡与
+	// 路由。不合格实例在此返回错误，调用方按既有的「坏值跳过 + 带键名 WARN」
+	// 路径剔除（fetchInstances 与 decodeAll 同走此处，两侧口径不再漂移）。
+	if err := validateInstance(inst); err != nil {
+		return regcore.Instance{}, err
+	}
+	return inst, nil
 }
 
 func validateInstance(inst regcore.Instance) error {

@@ -18,6 +18,13 @@ type ConfigStore struct {
 
 	mu        sync.Mutex
 	listeners map[string]*watchHandle // 配置键 → 监听句柄
+
+	// retired 承载已 StopListenConfig/Close 摘除、但观察 goroutine 尚未退出
+	// 的句柄（#149，与 Subscriber.retired 同构）：#84 的交接不能依赖「旧句柄
+	// 还在 listeners 里」——先删 map 再 supersede 会让停听后重建的监听拿到
+	// old==nil，交接整段失效，新旧回调并发。同一名字至多存在于两者之一；
+	// 槽位由观察 goroutine 退出时按身份自清（dropRetired）。
+	retired map[string]*watchHandle
 }
 
 var _ regcore.ConfigStore = (*ConfigStore)(nil)
@@ -30,7 +37,10 @@ func NewConfigStore(cli *clientv3.Client, opts ...OptionFunc) (*ConfigStore, err
 	if cli == nil {
 		return nil, ErrNilClient
 	}
-	return &ConfigStore{cli: cli, opt: applyOptions(opts), listeners: make(map[string]*watchHandle)}, nil
+	return &ConfigStore{
+		cli: cli, opt: applyOptions(opts),
+		listeners: make(map[string]*watchHandle), retired: make(map[string]*watchHandle),
+	}, nil
 }
 
 // PutConfig 写入配置（SPI 之外的便捷方法：供运维脚本/测试灌配置）。
@@ -86,7 +96,9 @@ func (c *ConfigStore) checkConfigName(dataID, group string) error {
 // goroutine 被标记取代并取消，其未投递的过期内容被丢弃，新监听等旧
 // goroutine 退出后才开始投递，新旧回调从不错峰并发（#84）。替换不阻塞
 // ListenConfig 调用方，但旧回调永久阻塞会拖住新监听的首次投递。监听生命
-// 周期与传入 ctx 无关，由 StopListenConfig 终止。
+// 周期与传入 ctx 无关，由 StopListenConfig 终止。停听（StopListenConfig）
+// 或 Close 之后立即重建监听同样遵守 #84 交接：被摘除的旧句柄保留在 retired
+// 待退出槽位，新监听仍能等到其退出后才投递（#149）。
 func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, onChange func(data string)) error {
 	if dataID == "" {
 		return fmt.Errorf("etcdx registry: dataID is empty")
@@ -109,6 +121,12 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 	h := newWatchHandle()
 	c.mu.Lock()
 	old := c.listeners[key]
+	if old == nil {
+		// 停听/关停后的重建监听（#149）：旧句柄已从 listeners 摘除但可能
+		// 仍在退出中，交接等待改读 retired 槽位
+		old = c.retired[key]
+		delete(c.retired, key)
+	}
 	if old != nil {
 		old.supersede() // 标记取代 + cancel：旧 goroutine 不再投递（仅 cancel 不交接，#84）
 	}
@@ -118,7 +136,11 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 	async.GoSafe(func() {
 		// #84：投递前先等被替换的旧 goroutine 退出（回调不可能并发），之后
 		// 所有投递前检查 superseded，被取代/停听后的过期内容一律丢弃。
-		defer h.close()
+		defer func() {
+			h.close()
+			// #149：观察 goroutine 退出后从 retired 槽位摘除自己（身份校验）
+			c.dropRetired(key, h)
+		}()
 		if old != nil {
 			select {
 			case <-old.done: // 旧 goroutine 已退出：此后才允许本监听投递
@@ -155,19 +177,24 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 				}
 			},
 			func(ctx context.Context) (int64, func(), error) {
-				resp, err := c.cli.Get(ctx, key, clientv3.WithKeysOnly())
+				// 单次完整 Get 同时取 revision 与当前值（#147）：此前 KeysOnly
+				// 取 revision、补投递闭包再做第二次完整 Get——第二次 Get 失败被
+				// `gerr == nil` 的空 else 静默吞掉，重建窗口内的变更无日志、无
+				// 投递、永久丢失（#83 只修了「键已删」分支）。现在取值与 revision
+				// 同源：Get 失败走上方 err → attempts++ 指数退避重试，与订阅侧
+				// resnap（单次 Get）同一错误口径；补投递闭包不再有自己的错误面。
+				resp, err := c.cli.Get(ctx, key)
 				if err != nil {
 					return 0, nil, err
 				}
+				cur := ""
+				if len(resp.Kvs) > 0 {
+					cur = string(resp.Kvs[0].Value)
+				}
 				return resp.Header.Revision + 1, func() {
-					// 重建后立即回调一次当前值（重建窗口内的变更不丢视图）。
-					if val, gerr := c.cli.Get(ctx, key); gerr == nil {
-						if len(val.Kvs) > 0 {
-							safeNotify(dataID, func() { onChange(string(val.Kvs[0].Value)) }) // #87
-						} else {
-							safeNotify(dataID, func() { onChange("") }) // #87
-						}
-					}
+					// 重建后立即回调一次当前值（重建窗口内的变更不丢视图）；
+					// 键已被删除时 cur 为空串，与 Delete 事件语义一致（#83）。
+					safeNotify(dataID, func() { onChange(cur) }) // onChange panic 不终结循环（#87）
 				}, nil
 			},
 		)
@@ -176,6 +203,12 @@ func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, on
 }
 
 // StopListenConfig 停止监听（未监听为 no-op）。
+//
+// 摘除的句柄先进入 retired 待退出槽位而非直接丢弃（#149，与
+// Subscriber.Unsubscribe 同口径）：其观察 goroutine 可能仍在执行消费方回调，
+// 后续同键 ListenConfig 靠该槽位拿到 old.done 完成 #84 交接——先删 map 再
+// supersede 会让交接整段失效（停听后重建监听与旧回调并发）。本方法不等待
+// 旧回调返回；槽位由观察 goroutine 退出时自清。
 func (c *ConfigStore) StopListenConfig(_ context.Context, dataID, group string) error {
 	g := c.opt.group(group)
 	if err := c.checkConfigName(dataID, g); err != nil {
@@ -184,7 +217,10 @@ func (c *ConfigStore) StopListenConfig(_ context.Context, dataID, group string) 
 	key := configKey(c.opt.Prefix, g, dataID)
 	c.mu.Lock()
 	h := c.listeners[key]
-	delete(c.listeners, key)
+	if h != nil {
+		delete(c.listeners, key)
+		c.retired[key] = h // #149：摘除后仍可被重建监听读到（同名至多一个）
+	}
 	c.mu.Unlock()
 	if h != nil {
 		h.supersede()
@@ -193,13 +229,29 @@ func (c *ConfigStore) StopListenConfig(_ context.Context, dataID, group string) 
 }
 
 // Close 停止全部监听。
+//
+// 被取消的句柄同样转入 retired 待退出槽位（#149，与 StopListenConfig 同
+// 口径）：Close 之后立即重建监听仍须等旧 goroutine 退出，回调不并发。
 func (c *ConfigStore) Close(_ context.Context) error {
 	c.mu.Lock()
 	ls := c.listeners
 	c.listeners = make(map[string]*watchHandle)
+	for name, h := range ls {
+		c.retired[name] = h // listeners/retired 同名不相交（见 retired 字段注释）
+	}
 	c.mu.Unlock()
 	for _, h := range ls {
 		h.supersede()
 	}
 	return nil
+}
+
+// dropRetired 观察 goroutine 退出时把自身从 retired 槽位摘除（身份校验：
+// 非本句柄则不动）。逻辑与 Subscriber.dropRetired 同构（#149）。
+func (c *ConfigStore) dropRetired(key string, h *watchHandle) {
+	c.mu.Lock()
+	if c.retired[key] == h {
+		delete(c.retired, key)
+	}
+	c.mu.Unlock()
 }
