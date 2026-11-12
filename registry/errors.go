@@ -14,3 +14,11 @@ import (
 //
 // 与 registry/nacosimpl 的 ErrNilClient 同口径。
 var ErrNilClient = errors.New("etcdx/registry: client must be non-nil")
+
+// ErrRegistrarClosed 表示注册器已 Close（终态）：此后 Register 永远失败。
+//
+// 关闭竞态（Register 进行中 Close 完成落闸）与优雅停机后的调用方需要区分
+// 「停止重试」与「瞬时失败」——此前这个明确的终态类别只返回裸
+// fmt.Errorf，调用方只能 strings.Contains 文案匹配（#131），两处重复文案
+// 今后还可能漂移。与 ErrNilClient 同为哨兵，errors.Is 判定。
+var ErrRegistrarClosed = errors.New("etcdx registry: registrar closed")

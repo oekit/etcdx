@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	regcore "github.com/oekit/registry"
+
+	"github.com/oekit/etcdx/internal/keyseg"
 )
 
 // serviceDir 返回某服务全部实例键的公共前缀（含尾部 "/"，供 WithPrefix 使用）。
@@ -89,16 +91,12 @@ func validateInstance(inst regcore.Instance) error {
 	return nil
 }
 
-// checkName 校验键路径段（service/group/dataID/ip）的层级边界（#110）：键
-// 空间按 "/" 分层，路径段含 "/" 时与分隔符不可区分——service "order/v2" 的
-// 实例键落在 "order/" 前缀之下，Discover("order") 的前缀扫描连带返回
-// order/v2 的实例并解码成 Service="order"（流量被路由到另一个服务，全程无
-// 报错）；configKey 同构，group "g/a"+dataID "b" 与 group "g"+dataID "a/b"
-// 拼出同一个键。注册/发现/订阅/配置入口 fail-fast，把键层级边界变成构造期
-// 不变量；键布局本身不变，既有干净键完全兼容。
+// checkName 校验键路径段（service/group/dataID/ip）的层级边界：规则单源在
+// internal/keyseg（registry#110 立约 + distlock#138 补齐共用，两包不复制
+// 规则文档），此处只保留 registry 侧的错误前缀包装。
 func checkName(kind, name string) error {
-	if strings.Contains(name, "/") {
-		return fmt.Errorf("etcdx registry: %s name %q must not contain %q (key hierarchy boundary, #110)", kind, name, "/")
+	if err := keyseg.Check(kind, name); err != nil {
+		return fmt.Errorf("etcdx registry: %w", err)
 	}
 	return nil
 }

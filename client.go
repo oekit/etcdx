@@ -46,13 +46,36 @@ func NewClient(opt *clientv3.Config) (*Client, error) {
 	return &Client{Client: c}, nil
 }
 
+// Health 探测预算（#125）：var 而非 const 仅供测试收窄窗口（测试同进程内
+// 改回即还原）；生产默认值语义为：单 endpoint 独立 3s 窗口、全序列总预算
+// 10s（AGENTS.md 超时区间「探测类 ≤10s」内）。
+var (
+	// healthEndpointWindow 是单个 endpoint 的 Member Status 探测窗口：首个
+	// 黑洞 endpoint 只吃自己的预算，不影响其余 endpoint 的探测（#125）。
+	healthEndpointWindow = 3 * time.Second
+	// healthTotalBudget 是 Health 全序列的总预算：endpoint 各自独立窗口后，
+	// 多 endpoint 串行探测的最坏总时长必须仍有界。
+	healthTotalBudget = 10 * time.Second
+)
+
 // Health 通过 Member Status 探活：任一 endpoint 可用即健康。
+//
+// 预算两级（#125）：每个 endpoint 一个独立的 3s 窗口——此前全部 endpoint
+// 共享一个 3s 窗口，首个黑洞 endpoint 吃光预算，其余 endpoint 在剩余≈0 的
+// 预算内全部瞬时失败，健康判定退化为「第一个 endpoint 的状态」；总预算
+// 10s 兜住多 endpoint 串行探测的最坏总时长（探测类 ≤10s 区间内）。
 func (c *Client) Health(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	total, cancel := context.WithTimeout(ctx, healthTotalBudget)
 	defer cancel()
 	var lastErr error
 	for _, ep := range c.Endpoints() {
-		_, err := c.Status(ctx, ep)
+		if total.Err() != nil {
+			break // 总预算耗尽：不再探测剩余 endpoint（#125 总预算兜底）
+		}
+		// 每 endpoint 独立窗口（#125）：黑洞 endpoint 最多吃掉自己的 3s
+		epCtx, epCancel := context.WithTimeout(total, healthEndpointWindow)
+		_, err := c.Status(epCtx, ep)
+		epCancel()
 		if err == nil {
 			return nil
 		}

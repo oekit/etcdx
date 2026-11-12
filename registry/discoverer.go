@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/oekit/logx"
 	regcore "github.com/oekit/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -75,7 +76,7 @@ func fetchInstances(ctx context.Context, cli *clientv3.Client, prefix, group, se
 		}
 		inst, err := decodeInstance(service, group, kv.Value)
 		if err != nil {
-			log.Warn("skip malformed instance", "key", string(kv.Key), "err", err)
+			log.Warn("skip malformed instance", "key", string(kv.Key), logx.ErrKey, err)
 			continue
 		}
 		out = append(out, inst)

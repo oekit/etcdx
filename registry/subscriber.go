@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/oekit/concurrency/async"
+	"github.com/oekit/logx"
 	regcore "github.com/oekit/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -154,7 +155,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 					if h.ctx.Err() != nil {
 						return // 取数窗口内被退订：runWatchLoop 统一退出
 					}
-					log.Warn("refresh after watch event failed", "service", serviceName, "err", err)
+					log.Warn("refresh after watch event failed", "service", serviceName, logx.ErrKey, err)
 					return
 				}
 				if h.superseded.Load() {
@@ -237,7 +238,7 @@ func decodeAll(service, group, dir string, resp *clientv3.GetResponse) []regcore
 		}
 		inst, err := decodeInstance(service, group, kv.Value)
 		if err != nil {
-			log.Warn("skip malformed instance", "key", string(kv.Key), "err", err)
+			log.Warn("skip malformed instance", "key", string(kv.Key), logx.ErrKey, err)
 			continue
 		}
 		out = append(out, inst)
