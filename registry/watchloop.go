@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/oekit/logx"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -41,7 +42,7 @@ func runWatchLoop(
 				// Compacted 时 WithRev(rev) 会被服务端取消——clientv3 不
 				// 自动重建，必须自己重建（#55）
 				log.Warn("watch canceled, rebuilding with exponential backoff",
-					"target", target, "err", wresp.Err())
+					"target", target, logx.ErrKey, wresp.Err())
 				canceled = true
 				break
 			}
@@ -70,7 +71,7 @@ func runWatchLoop(
 		if err != nil {
 			attempts++ // 每轮快照重取失败 attempts++（#85）
 			log.Warn("snapshot refresh for watch rebuild failed, retrying",
-				"target", target, "err", err, "attempts", attempts)
+				"target", target, logx.ErrKey, err, "attempts", attempts)
 			continue // 快照失败：下轮再试（rev 不变，可能仍 Compacted，会再退避）
 		}
 		rev = nextRev
