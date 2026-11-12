@@ -61,6 +61,10 @@ func NewClient(t *testing.T) *clientv3.Client {
 // Client 返回已连接的客户端（跨重启自动重连同一 endpoint）。
 func (s *Server) Client() *clientv3.Client { return s.cli }
 
+// ClientURL 返回服务端 client endpoint 地址（127.0.0.1:port），供测试自建
+// 带拦截器等定制项的 clientv3 客户端（如 registry #147 的故障注入探针）。
+func (s *Server) ClientURL() string { return s.clientURL }
+
 // start 以当前数据目录与端口启动服务端并等待就绪；首启 ClusterState 用
 // New（空目录建集群），重启用 Existing（从数据目录恢复既有集群）。
 func (s *Server) start(restart bool) {
