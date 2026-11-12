@@ -3,7 +3,7 @@ module github.com/oekit/etcdx
 go 1.26.0
 
 require (
-	github.com/oekit/concurrency v0.34.0
+	github.com/oekit/concurrency v0.34.1
 	github.com/oekit/logx v0.10.0
 	github.com/oekit/pkg v0.46.0
 	github.com/oekit/registry v0.5.15
