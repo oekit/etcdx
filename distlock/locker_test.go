@@ -3,12 +3,12 @@ package distlock
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	pkgerrors "github.com/oekit/pkg/errors"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc/codes"
@@ -309,11 +309,11 @@ func TestGracefulDegradation_NonTransportErrorExplicit(t *testing.T) {
 func TestIsUnreachableClassification(t *testing.T) {
 	unreachable := []error{
 		context.DeadlineExceeded,
-		fmt.Errorf("probe: %w", context.DeadlineExceeded),
+		pkgerrors.Wrap(context.DeadlineExceeded, "probe"),
 		status.Error(codes.Unavailable, "error reading preface"),
-		fmt.Errorf("etcd unreachable: %w", status.Error(codes.Unavailable, "connection closed")),
-		fmt.Errorf("dial tcp 127.0.0.1:1: %w", syscall.ECONNREFUSED),
-		fmt.Errorf("conn reset: %w", syscall.ECONNRESET),
+		pkgerrors.Wrap(status.Error(codes.Unavailable, "connection closed"), "etcd unreachable"),
+		pkgerrors.Wrap(syscall.ECONNREFUSED, "dial tcp 127.0.0.1:1"),
+		pkgerrors.Wrap(syscall.ECONNRESET, "conn reset"),
 	}
 	for _, err := range unreachable {
 		if !isUnreachable(err) {
@@ -326,7 +326,7 @@ func TestIsUnreachableClassification(t *testing.T) {
 		status.Error(codes.PermissionDenied, "etcdserver: permission denied"),
 		status.Error(codes.InvalidArgument, "etcdserver: user name is empty"),
 		rpctypes.ErrCompacted, // 压缩冲突：OutOfRange
-		fmt.Errorf("wrapped: %w", rpctypes.ErrCompacted),
+		pkgerrors.Wrap(rpctypes.ErrCompacted, "wrapped"),
 	}
 	for _, err := range business {
 		if isUnreachable(err) {

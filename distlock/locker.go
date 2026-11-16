@@ -16,6 +16,7 @@ import (
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
 	pkgdistlock "github.com/oekit/pkg/distlock"
+	pkgerrors "github.com/oekit/pkg/errors"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
@@ -260,7 +261,7 @@ func (l *EtcdLocker) Lock(ctx context.Context, key string, ttl, timeout time.Dur
 func (l *EtcdLocker) stageFailed(ctx context.Context, key, stage string, stageErr error) (string, error) {
 	if ctx.Err() != nil {
 		l.notify(key, false, ctx.Err())
-		return "", fmt.Errorf("etcdx distlock: caller context done while %s: %w", stage, ctx.Err())
+		return "", pkgerrors.Wrapf(ctx.Err(), "etcdx distlock: caller context done while %s", stage)
 	}
 	return l.degradeOrFail(key, stageErr)
 }
@@ -271,7 +272,7 @@ func (l *EtcdLocker) stageFailed(ctx context.Context, key, stage string, stageEr
 func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	do func(ctx context.Context, m *concurrency.Mutex) error) (string, error) {
 	if key == "" {
-		return "", fmt.Errorf("etcdx distlock: key is empty")
+		return "", pkgerrors.New("etcdx distlock: key is empty")
 	}
 	// 键层级边界校验（#138，规则单源见 internal/keyseg）：锁键经 lockKey
 	// 直接拼进 etcd 分层键空间，concurrency.Mutex 的互斥判定用前缀范围查询
@@ -279,14 +280,14 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	// 之内，持有 "a/b" 则 "a" 永远拿不到锁（单向过度互斥，与 registry 侧
 	// #110 的同类约定对齐）。参数错误在任何网络交互前 fail-fast。
 	if err := keyseg.Check("lock key", key); err != nil {
-		return "", fmt.Errorf("etcdx distlock: %w", err)
+		return "", pkgerrors.Wrap(err, "etcdx distlock")
 	}
 	// ttl≤0 与 redisx 对齐直接报错（#62）：同接口下 redisx 的 TryLock 对
 	// ttl≤0 返回 "distlock: ttl must be positive"；此前这里静默抬成 1s——
 	// 同一份调用代码换后端，一个是立刻报错、一个是悄悄持 1s 锁。零值/负值
 	// 是参数错误，在任何网络交互前 fail-fast。
 	if ttl <= 0 {
-		return "", fmt.Errorf("etcdx distlock: ttl must be positive, got %v", ttl)
+		return "", pkgerrors.Newf("etcdx distlock: ttl must be positive, got %v", ttl)
 	}
 	// 连接预检：轻量读在有界窗口内探活，失败直接降级/报错，不做后续网络
 	// 交互（#54 判别见 stageFailed）
@@ -295,7 +296,7 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	pcancel()
 	if perr != nil {
 		return l.stageFailed(ctx, key, "probing etcd",
-			fmt.Errorf("etcdx distlock: etcd unreachable: %w", perr))
+			pkgerrors.Wrapf(perr, "etcdx distlock: etcd unreachable"))
 	}
 	// 租约精度：etcd 的租约以**秒**为单位 ⇒ (0, 1s) 的亚秒 TTL 抬升至 1s。
 	// （redisx 侧走 SetNX 是精确毫秒 ⇒ 同一个 Locker 接口，200ms 的锁在
@@ -321,12 +322,12 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	gcancel()
 	if gerr != nil {
 		return l.stageFailed(ctx, key, "granting lease",
-			fmt.Errorf("etcdx distlock: grant lease: %w", gerr))
+			pkgerrors.Wrapf(gerr, "etcdx distlock: grant lease"))
 	}
 	session, err := concurrency.NewSession(l.cli, concurrency.WithLease(grant.ID), concurrency.WithTTL(ttlSec))
 	if err != nil {
 		return l.stageFailed(ctx, key, "creating session",
-			fmt.Errorf("etcdx distlock: new session: %w", err))
+			pkgerrors.Wrapf(err, "etcdx distlock: new session"))
 	}
 	m := concurrency.NewMutex(session, l.lockKey(key))
 	if err := do(ctx, m); err != nil {
@@ -343,7 +344,7 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 			l.notify(key, false, err)
 			return "", err
 		}
-		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: lock %s: %w", key, err))
+		return l.degradeOrFail(key, pkgerrors.Wrapf(err, "etcdx distlock: lock %s", key))
 	}
 	ownerID := newOwnerID()
 	h := &heldLock{ownerID: ownerID, session: session, mutex: m}
@@ -452,12 +453,12 @@ func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error
 	var err error
 	if h.mutex != nil {
 		if uerr := h.mutex.Unlock(ctx); uerr != nil {
-			err = fmt.Errorf("etcdx distlock: unlock %s: %w", key, uerr)
+			err = pkgerrors.Wrapf(uerr, "etcdx distlock: unlock %s", key)
 		}
 	}
 	// 关闭 Session 撤销租约：即便 Unlock 失败，键也随租约撤销删除
 	if cerr := h.session.Close(); cerr != nil && err == nil {
-		err = fmt.Errorf("etcdx distlock: close session %s: %w", key, cerr)
+		err = pkgerrors.Wrapf(cerr, "etcdx distlock: close session %s", key)
 	}
 	// #137：契约（pkg/distlock.Locker.Unlock）——「锁不存在或已易主（陈旧
 	// 持有者解锁）返回 ErrLockNotHeld；其它 error 为后端通信故障」。陈旧
@@ -467,7 +468,7 @@ func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error
 	// 契约点名的「锁已易主」哨兵，调用方无法用 errors.Is 判定「我已不再
 	// 持有」。这里把它翻译成契约哨兵（规则单源见 pkg/distlock 契约原文）。
 	if err != nil && errors.Is(err, rpctypes.ErrLeaseNotFound) {
-		return fmt.Errorf("etcdx distlock: unlock %s: %w", key, ErrLockNotHeld)
+		return pkgerrors.Wrapf(ErrLockNotHeld, "etcdx distlock: unlock %s", key)
 	}
 	return err
 }

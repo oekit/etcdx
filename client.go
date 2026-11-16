@@ -2,10 +2,10 @@ package etcdx
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
+	errors "github.com/oekit/pkg/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -30,10 +30,10 @@ type Client struct {
 // 字段被悄悄改掉（0 → 5s）。此前直接写入调用方的结构体，属未声明的副作用。
 func NewClient(opt *clientv3.Config) (*Client, error) {
 	if opt == nil {
-		return nil, fmt.Errorf("etcdx: config is nil")
+		return nil, errors.New("etcdx: config is nil")
 	}
 	if len(opt.Endpoints) == 0 {
-		return nil, fmt.Errorf("etcdx: endpoints is empty")
+		return nil, errors.New("etcdx: endpoints is empty")
 	}
 	cfg := *opt
 	if cfg.DialTimeout == 0 {
@@ -41,7 +41,7 @@ func NewClient(opt *clientv3.Config) (*Client, error) {
 	}
 	c, err := clientv3.New(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("etcdx: new client: %w", err)
+		return nil, errors.Wrapf(err, "etcdx: new client")
 	}
 	return &Client{Client: c}, nil
 }
@@ -82,9 +82,9 @@ func (c *Client) Health(ctx context.Context) error {
 		lastErr = err
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("etcdx: no endpoints")
+		lastErr = errors.New("etcdx: no endpoints")
 	}
-	return fmt.Errorf("etcdx: health check failed: %w", lastErr)
+	return errors.Wrapf(lastErr, "etcdx: health check failed")
 }
 
 // Close 幂等关停客户端（sync.Once 保证多次调用安全）。

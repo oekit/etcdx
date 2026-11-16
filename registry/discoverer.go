@@ -3,10 +3,10 @@ package registry
 import (
 	"cmp"
 	"context"
-	"fmt"
 	"slices"
 
 	"github.com/oekit/logx"
+	errors "github.com/oekit/pkg/errors"
 	regcore "github.com/oekit/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -52,7 +52,7 @@ func (d *Discoverer) DiscoverAll(ctx context.Context, serviceName string) ([]reg
 // fetchInstances 拉取并解码某服务下全部实例键；单个坏值跳过不致整批失败。
 func fetchInstances(ctx context.Context, cli *clientv3.Client, prefix, group, service string) ([]regcore.Instance, error) {
 	if service == "" {
-		return nil, fmt.Errorf("etcdx registry: service name is empty")
+		return nil, errors.New("etcdx registry: service name is empty")
 	}
 	// 键层级边界 fail-fast（#110）：名称段含 "/" 的服务/分组不被发现——
 	// 拼出的前缀会越界命中其他服务（或被其他服务命中）的键空间
@@ -65,7 +65,7 @@ func fetchInstances(ctx context.Context, cli *clientv3.Client, prefix, group, se
 	dir := serviceDir(prefix, group, service)
 	resp, err := cli.Get(ctx, dir, clientv3.WithPrefix())
 	if err != nil {
-		return nil, fmt.Errorf("etcdx registry: get %s: %w", service, err)
+		return nil, errors.Wrapf(err, "etcdx registry: get %s", service)
 	}
 	out := make([]regcore.Instance, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {

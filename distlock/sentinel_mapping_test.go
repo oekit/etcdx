@@ -3,11 +3,11 @@ package distlock
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
 	pkgdistlock "github.com/oekit/pkg/distlock"
+	pkgerrors "github.com/oekit/pkg/errors"
 
 	"github.com/oekit/etcdx/internal/testutil"
 )
@@ -59,7 +59,7 @@ func TestSentinelsArePkgContractValues(t *testing.T) {
 	}
 
 	// wrap 链上的哨兵判定不丢
-	if !errors.Is(fmt.Errorf("deploy lock: %w", ErrLockNotAcquired), pkgdistlock.ErrLockNotAcquired) {
+	if !errors.Is(pkgerrors.Wrap(ErrLockNotAcquired, "deploy lock"), pkgdistlock.ErrLockNotAcquired) {
 		t.Fatal("wrap 链上的 ErrLockNotAcquired 对 pkg 哨兵判定 false; want true")
 	}
 }

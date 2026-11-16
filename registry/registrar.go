@@ -3,12 +3,12 @@ package registry
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
+	pkgerrors "github.com/oekit/pkg/errors"
 	regcore "github.com/oekit/registry"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -175,7 +175,7 @@ func (r *Registrar) Close(ctx context.Context) error {
 	var errs []error
 	for key, reg := range regs {
 		if err := r.stop(ctx, reg); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", key, err))
+			errs = append(errs, pkgerrors.Wrapf(err, "%s", key))
 		}
 	}
 	return errors.Join(errs...)
@@ -190,7 +190,7 @@ func (r *Registrar) stop(ctx context.Context, reg *registration) error {
 		return nil
 	}
 	if _, err := r.cli.Revoke(ctx, id); err != nil && !errors.Is(err, rpctypes.ErrLeaseNotFound) {
-		return fmt.Errorf("etcdx registry: revoke lease %x: %w", id, err)
+		return pkgerrors.Wrapf(err, "etcdx registry: revoke lease %x", id)
 	}
 	return nil
 }
@@ -199,7 +199,7 @@ func (r *Registrar) stop(ctx context.Context, reg *registration) error {
 func (r *Registrar) putWithLease(ctx context.Context, key, val string) (clientv3.LeaseID, error) {
 	grant, err := r.cli.Grant(ctx, r.opt.ttlSeconds())
 	if err != nil {
-		return clientv3.NoLease, fmt.Errorf("etcdx registry: grant lease: %w", err)
+		return clientv3.NoLease, pkgerrors.Wrapf(err, "etcdx registry: grant lease")
 	}
 	if _, err := r.cli.Put(ctx, key, val, clientv3.WithLease(grant.ID)); err != nil {
 		// 回滚刚申请的租约：Revoke 失败不再 `_, _` 吞错（#126，同仓内
@@ -209,7 +209,7 @@ func (r *Registrar) putWithLease(ctx context.Context, key, val string) (clientv3
 			log.Warn("revoke lease after put failed, left to TTL reap",
 				"key", key, "lease", grant.ID, logx.ErrKey, rerr)
 		}
-		return clientv3.NoLease, fmt.Errorf("etcdx registry: put %s: %w", key, err)
+		return clientv3.NoLease, pkgerrors.Wrapf(err, "etcdx registry: put %s", key)
 	}
 	return grant.ID, nil
 }
