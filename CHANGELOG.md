@@ -2,6 +2,10 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.3.3] — 2026-11-16
+
+- refactor: fmt.Errorf → oekit/pkg/errors 三形态对位替换（#520 替换波）+ 依赖地板抬至 pkg v0.52.0。文案逐字节同形（测试断言零修改），多 %w/%w 居中/哨兵前置形态按仓规保留
+
 ## [v0.3.2] — 2026-11-13
 
 - 10 单修复批：watch 重建补投递（#147）、decodeInstance 复检（#148）、退订 retired 槽位（#149）、pkg#428 释放 ctx 口径测试适配等；地板对齐 pkg v0.47.0/core v0.15.1。
