@@ -2,9 +2,9 @@ package registry
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 
+	errors "github.com/oekit/pkg/errors"
 	regcore "github.com/oekit/registry"
 
 	"github.com/oekit/etcdx/internal/keyseg"
@@ -40,7 +40,7 @@ func encodeInstance(inst regcore.Instance) ([]byte, error) {
 		Metadata: inst.Metadata, Cluster: inst.Cluster,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("etcdx registry: encode instance: %w", err)
+		return nil, errors.Wrapf(err, "etcdx registry: encode instance")
 	}
 	return b, nil
 }
@@ -48,7 +48,7 @@ func encodeInstance(inst regcore.Instance) ([]byte, error) {
 func decodeInstance(service, group string, b []byte) (regcore.Instance, error) {
 	var v instanceValue
 	if err := json.Unmarshal(b, &v); err != nil {
-		return regcore.Instance{}, fmt.Errorf("etcdx registry: decode instance: %w", err)
+		return regcore.Instance{}, errors.Wrapf(err, "etcdx registry: decode instance")
 	}
 	inst := regcore.Instance{
 		Service: service, IP: v.IP, Port: v.Port, Weight: v.Weight,
@@ -68,7 +68,7 @@ func decodeInstance(service, group string, b []byte) (regcore.Instance, error) {
 
 func validateInstance(inst regcore.Instance) error {
 	if inst.Service == "" {
-		return fmt.Errorf("etcdx registry: service name is empty")
+		return errors.New("etcdx registry: service name is empty")
 	}
 	if err := checkName("service", inst.Service); err != nil {
 		return err
@@ -79,14 +79,14 @@ func validateInstance(inst regcore.Instance) error {
 		}
 	}
 	if inst.IP == "" {
-		return fmt.Errorf("etcdx registry: instance ip is empty")
+		return errors.New("etcdx registry: instance ip is empty")
 	}
 	// IP 是实例键的最后一段（serviceDir + Addr()），同样不得越出层级边界
 	if err := checkName("ip", inst.IP); err != nil {
 		return err
 	}
 	if inst.Port <= 0 || inst.Port > 65535 {
-		return fmt.Errorf("etcdx registry: invalid port %d", inst.Port)
+		return errors.Newf("etcdx registry: invalid port %d", inst.Port)
 	}
 	return nil
 }
@@ -96,7 +96,7 @@ func validateInstance(inst regcore.Instance) error {
 // 规则文档），此处只保留 registry 侧的错误前缀包装。
 func checkName(kind, name string) error {
 	if err := keyseg.Check(kind, name); err != nil {
-		return fmt.Errorf("etcdx registry: %w", err)
+		return errors.Wrap(err, "etcdx registry")
 	}
 	return nil
 }

@@ -2,7 +2,6 @@ package registry
 
 import (
 	"context"
-	"fmt"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
+	errors "github.com/oekit/pkg/errors"
 	regcore "github.com/oekit/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -63,7 +63,7 @@ func NewSubscriber(cli *clientv3.Client, opts ...OptionFunc) (*Subscriber, error
 // 此前先删 map 再 supersede，重建订阅读到 old==nil，交接被绕过）。
 func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func([]regcore.Instance)) error {
 	if serviceName == "" {
-		return fmt.Errorf("etcdx registry: service name is empty")
+		return errors.New("etcdx registry: service name is empty")
 	}
 	// 键层级边界 fail-fast（#110）：含 "/" 的服务/分组名拼出的 watch 前缀
 	// 会越界命中其他服务的键空间，快照里混入解码成 Service="order" 的
@@ -75,14 +75,14 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 		return err
 	}
 	if cb == nil {
-		return fmt.Errorf("etcdx registry: subscribe callback is nil")
+		return errors.New("etcdx registry: subscribe callback is nil")
 	}
 	dir := serviceDir(s.opt.Prefix, s.opt.Group, serviceName)
 
 	// 先取一次快照并记录 revision，Watch 从 revision+1 起不漏事件
 	resp, err := s.cli.Get(ctx, dir, clientv3.WithPrefix())
 	if err != nil {
-		return fmt.Errorf("etcdx registry: subscribe get %s: %w", serviceName, err)
+		return errors.Wrapf(err, "etcdx registry: subscribe get %s", serviceName)
 	}
 	startRev := resp.Header.Revision + 1
 

@@ -2,10 +2,10 @@ package registry
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"github.com/oekit/concurrency/async"
+	errors "github.com/oekit/pkg/errors"
 	regcore "github.com/oekit/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -46,14 +46,14 @@ func NewConfigStore(cli *clientv3.Client, opts ...OptionFunc) (*ConfigStore, err
 // PutConfig 写入配置（SPI 之外的便捷方法：供运维脚本/测试灌配置）。
 func (c *ConfigStore) PutConfig(ctx context.Context, dataID, group, content string) error {
 	if dataID == "" {
-		return fmt.Errorf("etcdx registry: dataID is empty")
+		return errors.New("etcdx registry: dataID is empty")
 	}
 	g := c.opt.group(group)
 	if err := c.checkConfigName(dataID, g); err != nil {
 		return err
 	}
 	if _, err := c.cli.Put(ctx, configKey(c.opt.Prefix, g, dataID), content); err != nil {
-		return fmt.Errorf("etcdx registry: put config %s: %w", dataID, err)
+		return errors.Wrapf(err, "etcdx registry: put config %s", dataID)
 	}
 	return nil
 }
@@ -61,7 +61,7 @@ func (c *ConfigStore) PutConfig(ctx context.Context, dataID, group, content stri
 // GetConfig 拉取配置内容；键不存在返回空字符串（非错误）。
 func (c *ConfigStore) GetConfig(ctx context.Context, dataID, group string) (string, error) {
 	if dataID == "" {
-		return "", fmt.Errorf("etcdx registry: dataID is empty")
+		return "", errors.New("etcdx registry: dataID is empty")
 	}
 	g := c.opt.group(group)
 	if err := c.checkConfigName(dataID, g); err != nil {
@@ -69,7 +69,7 @@ func (c *ConfigStore) GetConfig(ctx context.Context, dataID, group string) (stri
 	}
 	resp, err := c.cli.Get(ctx, configKey(c.opt.Prefix, g, dataID))
 	if err != nil {
-		return "", fmt.Errorf("etcdx registry: get config %s: %w", dataID, err)
+		return "", errors.Wrapf(err, "etcdx registry: get config %s", dataID)
 	}
 	if len(resp.Kvs) == 0 {
 		return "", nil
@@ -101,20 +101,20 @@ func (c *ConfigStore) checkConfigName(dataID, group string) error {
 // 待退出槽位，新监听仍能等到其退出后才投递（#149）。
 func (c *ConfigStore) ListenConfig(ctx context.Context, dataID, group string, onChange func(data string)) error {
 	if dataID == "" {
-		return fmt.Errorf("etcdx registry: dataID is empty")
+		return errors.New("etcdx registry: dataID is empty")
 	}
 	if err := c.checkConfigName(dataID, c.opt.group(group)); err != nil {
 		return err
 	}
 	if onChange == nil {
-		return fmt.Errorf("etcdx registry: onChange callback is nil")
+		return errors.New("etcdx registry: onChange callback is nil")
 	}
 	key := configKey(c.opt.Prefix, c.opt.group(group), dataID)
 
 	// 记录当前 revision，Watch 从 revision+1 起不漏变更
 	resp, err := c.cli.Get(ctx, key, clientv3.WithKeysOnly())
 	if err != nil {
-		return fmt.Errorf("etcdx registry: listen config %s: %w", dataID, err)
+		return errors.Wrapf(err, "etcdx registry: listen config %s", dataID)
 	}
 	startRev := resp.Header.Revision + 1
 
