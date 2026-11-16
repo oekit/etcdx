@@ -2,9 +2,9 @@ package etcdx
 
 import (
 	"context"
-	"fmt"
 	"time"
 
+	errors "github.com/oekit/pkg/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -39,7 +39,7 @@ func NewClientFromConfig(ctx context.Context, cfg EtcdConfig) (*Client, error) {
 	if err := c.Health(ctx); err != nil {
 		// 探活失败也要回收已创建的 client（gRPC 连接已建立）
 		_ = c.Close(ctx)
-		return nil, fmt.Errorf("etcdx: ping failed: %w", err)
+		return nil, errors.Wrapf(err, "etcdx: ping failed")
 	}
 	return c, nil
 }

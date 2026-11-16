@@ -20,15 +20,16 @@
 package keyseg
 
 import (
-	"fmt"
 	"strings"
+
+	errors "github.com/oekit/pkg/errors"
 )
 
 // Check 报告 name 作为单个键路径段是否越出层级边界（含 "/"）。
 // kind 仅用于错误文案定位（如 "service" / "group" / "lock key"）。
 func Check(kind, name string) error {
 	if strings.Contains(name, "/") {
-		return fmt.Errorf("%s %q must not contain %q (key hierarchy boundary, registry#110/distlock#138)", kind, name, "/")
+		return errors.Newf("%s %q must not contain %q (key hierarchy boundary, registry#110/distlock#138)", kind, name, "/")
 	}
 	return nil
 }
