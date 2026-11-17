@@ -2,6 +2,12 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.3.4] — 2026-11-18
+
+- NewClientFromConfig 探活失败回收 errors.Join 聚合上抛,对齐 redisx#149 口径(#184);registrar/subscriber 指数退避收敛 backoffFor 单源(#186);Subscriber/ConfigStore 句柄生命周期收敛 watchRegistry 泛型单源(#185);distlock ownerID 迁 stringx.RandomTokenOrFallback、安全网迁 distlock.MaxLifetime(pkg v0.53.0 原语)
+
+关联问题单：etcdx#184、etcdx#186、etcdx#185。
+
 ## [v0.3.3] — 2026-11-16
 
 - refactor: fmt.Errorf → oekit/pkg/errors 三形态对位替换（#520 替换波）+ 依赖地板抬至 pkg v0.52.0。文案逐字节同形（测试断言零修改），多 %w/%w 居中/哨兵前置形态按仓规保留
