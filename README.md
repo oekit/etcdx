@@ -8,7 +8,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/etcdx@v0.3.2
+go get github.com/oekit/etcdx@v0.3.3
 ```
 
 ## 这个仓库做什么
