@@ -65,7 +65,7 @@ func runWatchLoop(
 		select {
 		case <-h.ctx.Done():
 			return
-		case <-time.After(watchBackoff(attempts)):
+		case <-time.After(backoffFor(attempts)):
 		}
 		nextRev, deliver, err := resnap(h.ctx)
 		if err != nil {

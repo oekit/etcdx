@@ -237,9 +237,10 @@ func (r *Registrar) supervise(ctx context.Context, key, val string, reg *registr
 }
 
 // reRegister 退避重试直到成功或 ctx 取消；返回是否成功。
+// 退避派生与 watch 重建收敛同一单源 backoffFor（#186）：1s 起、30s 封顶
+// （乘后判 + 显式 min，封顶后恒 30s）。
 func (r *Registrar) reRegister(ctx context.Context, key, val string, reg *registration) bool {
-	backoff := time.Second
-	for {
+	for attempts := 0; ; attempts++ {
 		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		id, err := r.putWithLease(rctx, key, val)
 		cancel()
@@ -248,14 +249,12 @@ func (r *Registrar) reRegister(ctx context.Context, key, val string, reg *regist
 			log.Info("instance re-registered", "key", key, "lease", id)
 			return true
 		}
+		backoff := backoffFor(attempts)
 		log.Warn("re-register failed, will retry", "key", key, "backoff", backoff, logx.ErrKey, err)
 		select {
 		case <-ctx.Done():
 			return false
 		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
 		}
 	}
 }

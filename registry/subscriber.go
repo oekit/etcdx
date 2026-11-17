@@ -291,22 +291,28 @@ func safeNotify(target string, notify func()) {
 	notify()
 }
 
-// watch 重建的退避参数（Subscriber 与 ConfigStore 共用口径，#85）。
+// 指数退避的共享参数（#186 单源：注册侧 reRegister 与 watch 重建——
+// Subscriber/ConfigStore 共用 runWatchLoop——同一策略只此一份实现）。
 const (
-	watchBackoffBase  = time.Second // 首轮退避
-	watchBackoffMax   = 30 * time.Second
-	watchBackoffSteps = 5 // 1s<<5 = 32s ≥ 上限，attempts 封顶即不再增长
+	backoffBase = time.Second // 首轮退避
+	backoffMax  = 30 * time.Second
+	// backoffMaxAttempts 限制移位步数：1s<<5 = 32s 已越过封顶线，更多步只会
+	// 被显式 min 收敛；同时防 attempts 极大时 << 移位回绕成 0。防溢出护栏，
+	// 不改变封顶语义（乘后判，见 backoffFor）。
+	backoffMaxAttempts = 30
 )
 
-// watchBackoff 由连续重建失败次数派生单轮退避：min(上限, 基数<<attempts)。
-// 成功重建后调用方将 attempts 归零 ⇒ 退避随之归零（#85）。
-func watchBackoff(attempts int) time.Duration {
-	if attempts > watchBackoffSteps {
-		attempts = watchBackoffSteps
+// backoffFor 由连续失败次数派生单轮指数退避：1s 起、30s 封顶。
+//
+// 封顶语义取「乘后判 + 显式 min」：先按 attempts 指数翻倍、再与上限比较，
+// 越过封顶线的值被显式 min 收敛——attempts ≥ 5（1s<<5 = 32s > 30s）后恒为
+// 30s，不出现乘前判的 32s 越顶值。成功重建/重注册后调用方将 attempts 归零
+// ⇒ 退避随之归零（#85）。
+func backoffFor(attempts int) time.Duration {
+	if attempts < 0 {
+		attempts = 0
+	} else if attempts > backoffMaxAttempts {
+		attempts = backoffMaxAttempts
 	}
-	d := watchBackoffBase << uint(attempts)
-	if d > watchBackoffMax {
-		return watchBackoffMax
-	}
-	return d
+	return min(backoffBase<<uint(attempts), backoffMax)
 }
