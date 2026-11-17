@@ -2,8 +2,6 @@ package distlock
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +15,7 @@ import (
 	"github.com/oekit/logx"
 	pkgdistlock "github.com/oekit/pkg/distlock"
 	pkgerrors "github.com/oekit/pkg/errors"
+	stringx "github.com/oekit/pkg/stringx"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
@@ -371,15 +370,14 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 // stop 返回的函数用于在 Unlock / Close 时提前终止安全网（此时锁是正常释放的，
 // 不该等到期）。
 func (l *EtcdLocker) startSafetyNet(key, ownerID string, session *concurrency.Session, ttl time.Duration) func() {
-	maxHold := l.maxHold
-	switch {
-	case maxHold < 0:
+	// 三态口径单源:pkg/distlock.MaxLifetime(0→10×ttl、负→0 表不限、正→显式;
+	// #534 照搬 redisx watchdog 语义)。MaxLifetime 返回 <=0 即「无 deadline」:
+	// 仅 WithMaxHold 负值（不限）会落到这里。旧实现的防御分支「10×ttl<=0 时
+	// 兜底 10s」不可达——acquire 对 ttl<=0 在任何网络交互前 fail-fast（#62）,
+	// 走到本函数时 ttl>0 恒成立,10×ttl 恒为正。
+	maxHold := pkgdistlock.MaxLifetime(l.maxHold, ttl)
+	if maxHold <= 0 {
 		return nil // 不限制：完全依赖调用方 Unlock
-	case maxHold == 0:
-		maxHold = 10 * ttl
-		if maxHold <= 0 {
-			maxHold = 10 * time.Second
-		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	async.GoSafe(func() {
@@ -535,11 +533,20 @@ func (l *EtcdLocker) lockKey(key string) string {
 	return l.prefix + "/" + key
 }
 
+// newOwnerID 生成锁 ownerID：单源 pkg/stringx.RandomTokenOrFallback
+// （16B → base64.RawURLEncoding，编码值域与旧手搓实现逐形态一致，对拍
+// 已验）。随机源失败按调用方显式选择退时间戳 ID（fallback 保留原降级
+// 逻辑，降级成功返回 nil error——见 pkg godoc）。
 func newOwnerID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	ownerID, err := stringx.RandomTokenOrFallback(16, stringx.TokenBase64RawURL, func() string {
 		// crypto/rand 失败极罕见；退化为时间戳保证非空且基本唯一
 		return fmt.Sprintf("t%d", time.Now().UnixNano())
+	})
+	if err != nil {
+		// RandomTokenOrFallback 仅在参数/用法错误（nBytes<=0、enc 非法、
+		// fallback 为 nil）时返回 error——本调用三参全为编译期字面量合法值，
+		// 此分支理论不可达；若触发即代码被改坏的确定性信号，fail-fast 不静默。
+		panic("etcdx distlock: newOwnerID 参数为编译期常量，RandomTokenOrFallback 不应返回 error: " + err.Error())
 	}
-	return base64.RawURLEncoding.EncodeToString(b[:])
+	return ownerID
 }
