@@ -2,6 +2,12 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.3.5] — 2026-11-19
+
+- - fix: registry 面两处可观测性/韧性修复——替换旧注册的 stop 失败由 _ = 吞错改记 Warn（同 #126 口径，该路径是唯一孤儿租约场景）；watch 重建 resnap 的 Get 套 probe.Window（3s，与 distlock #111 connProbeWindow 同源常量）有界窗口，etcd 半开/黑洞不再无限阻塞重建循环（#196）
+
+关联问题单：etcdx#196。
+
 ## [v0.3.4] — 2026-11-18
 
 - NewClientFromConfig 探活失败回收 errors.Join 聚合上抛,对齐 redisx#149 口径(#184);registrar/subscriber 指数退避收敛 backoffFor 单源(#186);Subscriber/ConfigStore 句柄生命周期收敛 watchRegistry 泛型单源(#185);distlock ownerID 迁 stringx.RandomTokenOrFallback、安全网迁 distlock.MaxLifetime(pkg v0.53.0 原语)
