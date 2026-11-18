@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/oekit/etcdx/internal/keyseg"
+	"github.com/oekit/etcdx/internal/probe"
 )
 
 var log = logx.Delegating("etcdx.distlock")
@@ -86,11 +87,6 @@ var (
 type Locker = pkgdistlock.Locker
 
 const defaultPrefix = "/oekit/distlock"
-
-// connProbeWindow 是加锁链路每一步网络交互的有界窗口（连接预检、租约 Grant
-// 各一个窗口，与调用方 ctx 取较小者）：预检与 Grant 之间 etcd 进入黑洞时，
-// caller 的 deadline 是唯一出口（#111）。
-const connProbeWindow = 3 * time.Second
 
 // EtcdLocker 是基于 etcd Session + concurrency.Mutex 的分布式锁实现。
 type EtcdLocker struct {
@@ -289,8 +285,10 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 		return "", pkgerrors.Newf("etcdx distlock: ttl must be positive, got %v", ttl)
 	}
 	// 连接预检：轻量读在有界窗口内探活，失败直接降级/报错，不做后续网络
-	// 交互（#54 判别见 stageFailed）
-	pctx, pcancel := context.WithTimeout(ctx, connProbeWindow)
+	// 交互（#54 判别见 stageFailed）。窗口数值单源 internal/probe（#111 立值，
+	// registry watch 重建快照重取 #196 接入同源）——预检与 Grant 之间 etcd
+	// 进入黑洞时，caller 的 deadline 是唯一出口。
+	pctx, pcancel := context.WithTimeout(ctx, probe.Window)
 	_, perr := l.cli.Get(pctx, l.prefix)
 	pcancel()
 	if perr != nil {
@@ -316,7 +314,7 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	// 不变，创建全程有界，失败走与预检相同的 degradeOrFail 分类。WithTTL
 	// 保留供 Session.Close 的 Revoke 窗口使用（租约实际 TTL 以服务端返回
 	// 为准，与 keepalive 无关）。
-	gctx, gcancel := context.WithTimeout(clientv3.WithRequireLeader(ctx), connProbeWindow)
+	gctx, gcancel := context.WithTimeout(clientv3.WithRequireLeader(ctx), probe.Window)
 	grant, gerr := l.cli.Grant(gctx, int64(ttlSec))
 	gcancel()
 	if gerr != nil {

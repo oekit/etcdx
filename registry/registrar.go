@@ -102,7 +102,15 @@ func (r *Registrar) Register(ctx context.Context, inst regcore.Instance) error {
 	delete(r.regs, key)
 	r.mu.Unlock()
 	if old != nil {
-		_ = r.stop(ctx, old) // 旧注册清理失败不阻断新注册；旧租约由 TTL 兜底
+		// 替换旧注册的 stop 失败不再 `_ =` 吞错（#196，与 putWithLease / 二次
+		// 落闸竞态两条 Revoke 失败路径同取 #126 口径）：这是唯一产生孤儿租约的
+		// 场景——旧注册已出 regs 表（上方 delete）、其 supervise 已 cancel，
+		// Deregister/Close 都收不到它，Revoke 失败若无日志痕迹，孤儿租约只能
+		// 等 TTL 兜底过期且全程不可观测。记 Warn 留痕，不阻断新注册。
+		if serr := r.stop(ctx, old); serr != nil {
+			log.Warn("stop old registration during replace failed, left to TTL reap",
+				"key", key, "lease", old.lease(), logx.ErrKey, serr)
+		}
 	}
 
 	leaseID, err := r.putWithLease(ctx, key, string(val))
