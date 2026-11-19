@@ -248,7 +248,8 @@ func (r *Registrar) supervise(ctx context.Context, key, val string, reg *registr
 
 // reRegister 退避重试直到成功或 ctx 取消；返回是否成功。
 // 退避派生与 watch 重建收敛同一单源 backoffFor（#186）：1s 起、30s 封顶
-// （封顶后恒 30s）。
+// （公式与护栏单源 concurrency/retry.SaturatedBackoff，#204 收编；封顶后
+// 恒 30s）。
 func (r *Registrar) reRegister(ctx context.Context, key, val string, reg *registration) bool {
 	for attempts := 0; ; attempts++ {
 		// 单次重注册套探活窗口（#202）：supervise 的 ctx 由 WithCancel 派生、
