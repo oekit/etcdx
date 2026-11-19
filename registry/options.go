@@ -21,6 +21,10 @@ type Option struct {
 	TTL time.Duration
 }
 
+// clampWarnMsg 亚秒 TTL 钳值 Warn 的消息单源（#203）：文案与同仓 distlock
+// 亚秒锁 TTL 抬升明示（#62）同款，测试同源断言，不复制字符串字面量。
+const clampWarnMsg = "sub-second ttl raised to 1s (etcd lease granularity is seconds)"
+
 // OptionFunc 配置函数类型。
 type OptionFunc func(*Option)
 
@@ -53,7 +57,13 @@ func applyOptions(opts []OptionFunc) *Option {
 	if o.Group == "" {
 		o.Group = defaultGroup
 	}
+	// 亚秒 TTL 钳值不再静默（#203）：对齐同仓 distlock 亚秒锁 TTL 抬升的约定
+	// （#62 立约「抬升时至少打 Warn 明示，不再静默」）——etcd 租约以**秒**为
+	// 单位，(0, 1s) 的 TTL 钳到 1s 是租约精度的机制性限制而非 bug，但调用方
+	// 按毫秒理解会误判（同一 TTL 在 redisx 侧精确生效），钳值时打 Warn 明示。
+	// applyOptions 仅在四个组件的构造函数各跑一次，Warn 不会重复刷屏。
 	if o.TTL < time.Second {
+		log.Warn(clampWarnMsg, "ttl", o.TTL)
 		o.TTL = time.Second
 	}
 	return o
