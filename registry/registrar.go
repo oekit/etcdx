@@ -12,6 +12,8 @@ import (
 	regcore "github.com/oekit/registry"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/oekit/etcdx/internal/probe"
 )
 
 var log = logx.Delegating("etcdx.registry")
@@ -250,7 +252,13 @@ func (r *Registrar) supervise(ctx context.Context, key, val string, reg *registr
 // 恒 30s）。
 func (r *Registrar) reRegister(ctx context.Context, key, val string, reg *registration) bool {
 	for attempts := 0; ; attempts++ {
-		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		// 单次重注册套探活窗口（#202）：supervise 的 ctx 由 WithCancel 派生、
+		// 无 deadline，etcd 半开连接/网络黑洞下 Grant/Put 可能无限挂起——此前
+		// 此处硬编码 5s 超时，数值游离在探活单源之外；改用 probe.Window 收口
+		// （#196 watch resnap 接入的同一单源，distlock#111 立值）。窗口到期 ⇒
+		// putWithLease 以 DeadlineExceeded 失败 ⇒ 走下方既有 attempts++ 退避
+		// 路径，重注册闭环不变。
+		rctx, cancel := context.WithTimeout(ctx, probe.Window)
 		id, err := r.putWithLease(rctx, key, val)
 		cancel()
 		if err == nil {
