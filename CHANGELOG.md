@@ -2,6 +2,12 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.3.6] — 2026-11-20
+
+- fix(registry): probe.Window 第二批漏网收口——reRegister 5s 硬编码改单源、onEvent 事件取数裸 Get 套窗口（#196 同型：半开连接黑洞下订阅静默停更）（#202）
+fix(registry): options 亚秒 TTL 静默钳值补 Warn——对齐 distlock #62「抬升至少明示」立约（#203）
+refactor(registry): backoffFor 薄委托 retry.SaturatedBackoff——#128/#362 手抄公式第三份收编，饱和护栏单源化（#204）
+
 ## [v0.3.5] — 2026-11-19
 
 - - fix: registry 面两处可观测性/韧性修复——替换旧注册的 stop 失败由 _ = 吞错改记 Warn（同 #126 口径，该路径是唯一孤儿租约场景）；watch 重建 resnap 的 Get 套 probe.Window（3s，与 distlock #111 connProbeWindow 同源常量）有界窗口，etcd 半开/黑洞不再无限阻塞重建循环（#196）
