@@ -9,6 +9,8 @@ import (
 	errors "github.com/oekit/pkg/errors"
 	regcore "github.com/oekit/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/oekit/etcdx/internal/probe"
 )
 
 // Subscriber 是 regcore.Subscriber 的 etcd 实现：Watch 服务前缀，任一实例
@@ -116,7 +118,16 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 				if len(wresp.Events) == 0 {
 					return
 				}
-				insts, err := fetchInstances(h.ctx, s.cli, s.opt.Prefix, s.opt.Group, serviceName)
+				// 事件批取数套探活窗口（#202）：h.ctx 由 WithCancel(Background)
+				// 派生、无 deadline——etcd 半开连接/网络黑洞下 fetchInstances 内
+				// 的 Get 无限挂起，onEvent 卡死不返回，后续事件全部积压，订阅
+				// 静默停更（与 #196 resnap 修复同型）。窗口数值单源 internal/probe
+				// （distlock#111 立值、#196 watch resnap 接入）；窗口到期 ⇒ Get
+				// 以 DeadlineExceeded 失败 ⇒ 走下方既有 Warn 丢弃分支，watch
+				// 循环与退避闭环不变（形态与 watchloop.go 的 resnap 窗口一致）。
+				fctx, fcancel := context.WithTimeout(h.ctx, probe.Window)
+				insts, err := fetchInstances(fctx, s.cli, s.opt.Prefix, s.opt.Group, serviceName)
+				fcancel()
 				if err != nil {
 					if h.ctx.Err() != nil {
 						return // 取数窗口内被退订：runWatchLoop 统一退出
