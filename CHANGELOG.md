@@ -2,6 +2,12 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.3.7] — 2026-11-21
+
+- - fix: distlock Unlock 先释放成功再删 held 账本、通信类失败保留记录可重试、ErrLockNotHeld 终态才清、Close 失败条目回填聚合（#299）
+
+关联问题单：etcdx#299。
+
 ## [v0.3.6] — 2026-11-20
 
 - fix(registry): probe.Window 第二批漏网收口——reRegister 5s 硬编码改单源、onEvent 事件取数裸 Get 套窗口（#196 同型：半开连接黑洞下订阅静默停更）（#202）
