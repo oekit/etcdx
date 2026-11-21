@@ -6,7 +6,7 @@ require (
 	github.com/oekit/concurrency v0.40.0
 	github.com/oekit/logx v0.12.1
 	github.com/oekit/pkg v0.56.0
-	github.com/oekit/registry v0.8.2
+	github.com/oekit/registry v0.8.3
 	go.etcd.io/etcd/api/v3 v3.7.3
 	go.etcd.io/etcd/client/v3 v3.7.3
 	go.etcd.io/etcd/server/v3 v3.7.3
