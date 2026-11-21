@@ -106,6 +106,11 @@ type EtcdLocker struct {
 	// （租约继续续期 ⇒ 锁不释放），且前一个 owner 的 Unlock 因 ownerID 不匹配
 	// 报 ErrNotOwner ⇒ 它的锁也放不掉。
 	held map[string]map[string]*heldLock
+
+	// releaseFunc 仅供包内测试注入释放结果（nil = 走真实 release）。
+	// 释放账本（保留/删除记录）的判据与网络实现解耦，供 data#299 的
+	// 「通信失败保留记录、可重试」用例确定性覆盖。
+	releaseFunc func(context.Context, string, *heldLock) error
 }
 
 type heldLock struct {
@@ -115,6 +120,10 @@ type heldLock struct {
 	// stopSafety 停掉本次持有的「最大持锁时长」安全网 goroutine
 	// （Unlock / Close 时调用；安全网自行触发后由它自己结束）。
 	stopSafety func()
+	// releasing 表示一次 Unlock/Close 的释放正在进行（l.mu 保护）。
+	// 释放失败时记录保留并复位；并发的第二个 Unlock 收到 ErrNotOwner
+	// （与「记录已删除」的单次释放语义一致），不会重复发起 Delete/Revoke。
+	releasing bool
 }
 
 var _ Locker = (*EtcdLocker)(nil)
@@ -407,36 +416,110 @@ func (l *EtcdLocker) setHeld(key, ownerID string, h *heldLock) {
 }
 
 // Unlock 释放锁：ownerID 须与本进程持有记录一致；释放后 Session 关闭回收租约。
+//
+// # 删除账本的时机（data#299 etcdx 半边）
+//
+// **先释放、成功后再删除 held 记录**：通信类失败（网络瞬断 / ctx 在发
+// Delete/Revoke 前到期）时锁可能仍在 etcd 里，若先把记录删掉，调用方按
+// 契约重试 Unlock 只会得到 ErrNotOwner（=ErrLockNotHeld 终态），锁只能
+// 等 TTL 自然过期。现在失败记录保留并返回可重试错误——同一 (key,
+// ownerID) 可再次 Unlock；释放路径幂等（重复 Delete/Revoke 无害，
+// ErrLockReleased 视作已释放），成功或判定「租约已不存在」后才删记录。
+//
+// 若 Session.Close（撤销租约）成功，则即便 Mutex.Unlock 失败也已达成
+// 「锁键从 etcd 删除」的契约结果（撤销租约删除该会话全部键），按成功
+// 处理并删除记录；仅两次操作都失败才保留记录返回错误。
 func (l *EtcdLocker) Unlock(ctx context.Context, key, ownerID string) error {
 	l.mu.Lock()
 	h := l.held[key][ownerID]
-	if h == nil {
+	if h == nil || h.releasing {
 		l.mu.Unlock()
 		return ErrNotOwner
 	}
-	delete(l.held[key], ownerID)
-	if len(l.held[key]) == 0 {
-		delete(l.held, key)
-	}
+	h.releasing = true
 	l.mu.Unlock()
-	return l.release(ctx, key, h)
+
+	err := l.doRelease(ctx, key, h)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err == nil || errors.Is(err, ErrLockNotHeld) {
+		// 释放成功 / 判定锁已不存在：记录使命结束。
+		l.dropHeldLocked(key, ownerID, h)
+		return err
+	}
+	// 通信类或未知失败：保留记录（复位 releasing），允许同一持有者重试。
+	h.releasing = false
+	return err
 }
 
 // Close 释放本进程持有的全部锁（幂等）。
+//
+// 失败条目**不回填丢失**：账本不再整体交换清空，只有释放成功（或判定
+// 锁已不存在）的条目才删除；失败条目留在 l.held 中，错误经 errors.Join
+// 汇总返回，下一次 Close/Unlock 可继续重试。并发 Unlock 正在释放
+// （releasing）的条目跳过，由其调用方负责结果。
 func (l *EtcdLocker) Close(ctx context.Context) error {
+	type closeEntry struct {
+		key     string
+		ownerID string
+		h       *heldLock
+	}
+
 	l.mu.Lock()
-	held := l.held
-	l.held = make(map[string]map[string]*heldLock)
-	l.mu.Unlock()
-	var errs []error
-	for key, byOwner := range held {
-		for _, h := range byOwner {
-			if err := l.release(ctx, key, h); err != nil {
-				errs = append(errs, err)
+	entries := make([]closeEntry, 0, len(l.held))
+	for key, byOwner := range l.held {
+		for ownerID, h := range byOwner {
+			if h.releasing {
+				continue
 			}
+			h.releasing = true
+			entries = append(entries, closeEntry{key: key, ownerID: ownerID, h: h})
+		}
+	}
+	l.mu.Unlock()
+
+	var errs []error
+	for _, e := range entries {
+		err := l.doRelease(ctx, e.key, e.h)
+		l.mu.Lock()
+		if err == nil || errors.Is(err, ErrLockNotHeld) {
+			l.dropHeldLocked(e.key, e.ownerID, e.h)
+		} else {
+			// 释放失败：条目留在账本，供下一次 Close/Unlock 重试
+			// （不是「先取走 held，失败条目不回填」的旧行为）。
+			e.h.releasing = false
+		}
+		l.mu.Unlock()
+		if err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// dropHeldLocked 删除指定持有记录（调用方须持有 l.mu）。按指针身份校验，
+// 避免误删同 (key, ownerID) 的新记录。
+func (l *EtcdLocker) dropHeldLocked(key, ownerID string, h *heldLock) {
+	byOwner := l.held[key]
+	if byOwner == nil {
+		return
+	}
+	if cur, ok := byOwner[ownerID]; !ok || cur != h {
+		return
+	}
+	delete(byOwner, ownerID)
+	if len(byOwner) == 0 {
+		delete(l.held, key)
+	}
+}
+
+// doRelease 执行一次释放（测试可经 releaseFunc 注入失败结果）。
+func (l *EtcdLocker) doRelease(ctx context.Context, key string, h *heldLock) error {
+	if l.releaseFunc != nil {
+		return l.releaseFunc(ctx, key, h)
+	}
+	return l.release(ctx, key, h)
 }
 
 func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error {
@@ -446,16 +529,27 @@ func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error
 	if h.session == nil { // 降级放行的锁无需释放
 		return nil
 	}
-	var err error
+	var unlockErr error
 	if h.mutex != nil {
-		if uerr := h.mutex.Unlock(ctx); uerr != nil {
-			err = pkgerrors.Wrapf(uerr, "etcdx distlock: unlock %s", key)
+		uerr := h.mutex.Unlock(ctx)
+		// ErrLockReleased = 上一次释放已经删过键（重试路径的正常形态）。
+		if uerr != nil && !errors.Is(uerr, concurrency.ErrLockReleased) {
+			unlockErr = pkgerrors.Wrapf(uerr, "etcdx distlock: unlock %s", key)
 		}
 	}
-	// 关闭 Session 撤销租约：即便 Unlock 失败，键也随租约撤销删除
-	if cerr := h.session.Close(); cerr != nil && err == nil {
-		err = pkgerrors.Wrapf(cerr, "etcdx distlock: close session %s", key)
+	// 关闭 Session 撤销租约：即便 Unlock 失败，键也随租约撤销删除。
+	cerr := h.session.Close()
+	if cerr == nil {
+		// 撤销租约成功 ⇒ 该会话的全部键已删除，锁确实释放了。此时
+		// Mutex.Unlock 的失败（典型：caller ctx 已取消）被 Revoke 覆盖，
+		// 不能把成功报成可重试失败——重试反而会撞 ErrLockReleased /
+		// ErrLeaseNotFound 的终态噪音。
+		if unlockErr != nil {
+			log.Warn("mutex unlock failed but session revoke succeeded", "key", key, logx.ErrKey, unlockErr)
+		}
+		return nil
 	}
+	err := errors.Join(unlockErr, pkgerrors.Wrapf(cerr, "etcdx distlock: close session %s", key))
 	// #137：契约（pkg/distlock.Locker.Unlock）——「锁不存在或已易主（陈旧
 	// 持有者解锁）返回 ErrLockNotHeld；其它 error 为后端通信故障」。陈旧
 	// 持有者（租约失效后被他人重新拿锁）在 etcd 侧的表象：Mutex.Unlock 删
@@ -463,7 +557,15 @@ func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error
 	// Revoke 返回 ErrLeaseNotFound——此前该原始 etcd 错误直出，恰好顶替了
 	// 契约点名的「锁已易主」哨兵，调用方无法用 errors.Is 判定「我已不再
 	// 持有」。这里把它翻译成契约哨兵（规则单源见 pkg/distlock 契约原文）。
-	if err != nil && errors.Is(err, rpctypes.ErrLeaseNotFound) {
+	if errors.Is(err, rpctypes.ErrLeaseNotFound) {
+		// 租约已被回收（TTL 过期 / MaxHold 安全网 / 外部撤销）：无论
+		// Mutex.Unlock 的 Delete 是否幂等成功，本次调用都没有真正释放
+		// 一把仍属于自己的锁 ⇒ 契约哨兵（#137）。重试路径同样收敛于此：
+		// 上一次已删键、只剩撤销失败时，重试拿到本哨兵后记录被清理，
+		// 调用方按「已不再持有」终止重试。
+		if unlockErr != nil {
+			log.Warn("unlock failed and lease already gone", "key", key, logx.ErrKey, unlockErr)
+		}
 		return pkgerrors.Wrapf(ErrLockNotHeld, "etcdx distlock: unlock %s", key)
 	}
 	return err
