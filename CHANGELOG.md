@@ -2,6 +2,10 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.3.8] — 2026-11-23
+
+- build: 依赖地板对齐（矩阵地板波次）——新地板：github.com/oekit/pkg v0.60.0 。零行为变化；已发布产物的 go.mod 地板此前滞后于矩阵登记版本，本版把新地板焊进已发布产物。
+
 ## [v0.3.7] — 2026-11-21
 
 - - fix: distlock Unlock 先释放成功再删 held 账本、通信类失败保留记录可重试、ErrLockNotHeld 终态才清、Close 失败条目回填聚合（#299）
