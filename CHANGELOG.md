@@ -2,6 +2,38 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.3.8] — 2026-11-23
+
+- build: 依赖地板对齐（矩阵地板波次）——新地板：github.com/oekit/pkg v0.60.0 。零行为变化；已发布产物的 go.mod 地板此前滞后于矩阵登记版本，本版把新地板焊进已发布产物。
+
+## [v0.3.7] — 2026-11-21
+
+- - fix: distlock Unlock 先释放成功再删 held 账本、通信类失败保留记录可重试、ErrLockNotHeld 终态才清、Close 失败条目回填聚合（#299）
+
+关联问题单：etcdx#299。
+
+## [v0.3.6] — 2026-11-20
+
+- fix(registry): probe.Window 第二批漏网收口——reRegister 5s 硬编码改单源、onEvent 事件取数裸 Get 套窗口（#196 同型：半开连接黑洞下订阅静默停更）（#202）
+fix(registry): options 亚秒 TTL 静默钳值补 Warn——对齐 distlock #62「抬升至少明示」立约（#203）
+refactor(registry): backoffFor 薄委托 retry.SaturatedBackoff——#128/#362 手抄公式第三份收编，饱和护栏单源化（#204）
+
+## [v0.3.5] — 2026-11-19
+
+- - fix: registry 面两处可观测性/韧性修复——替换旧注册的 stop 失败由 _ = 吞错改记 Warn（同 #126 口径，该路径是唯一孤儿租约场景）；watch 重建 resnap 的 Get 套 probe.Window（3s，与 distlock #111 connProbeWindow 同源常量）有界窗口，etcd 半开/黑洞不再无限阻塞重建循环（#196）
+
+关联问题单：etcdx#196。
+
+## [v0.3.4] — 2026-11-18
+
+- NewClientFromConfig 探活失败回收 errors.Join 聚合上抛,对齐 redisx#149 口径(#184);registrar/subscriber 指数退避收敛 backoffFor 单源(#186);Subscriber/ConfigStore 句柄生命周期收敛 watchRegistry 泛型单源(#185);distlock ownerID 迁 stringx.RandomTokenOrFallback、安全网迁 distlock.MaxLifetime(pkg v0.53.0 原语)
+
+关联问题单：etcdx#184、etcdx#186、etcdx#185。
+
+## [v0.3.3] — 2026-11-16
+
+- refactor: fmt.Errorf → oekit/pkg/errors 三形态对位替换（#520 替换波）+ 依赖地板抬至 pkg v0.52.0。文案逐字节同形（测试断言零修改），多 %w/%w 居中/哨兵前置形态按仓规保留
+
 ## [v0.3.2] — 2026-11-13
 
 - 10 单修复批：watch 重建补投递（#147）、decodeInstance 复检（#148）、退订 retired 槽位（#149）、pkg#428 释放 ctx 口径测试适配等；地板对齐 pkg v0.47.0/core v0.15.1。

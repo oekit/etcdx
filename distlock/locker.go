@@ -2,8 +2,6 @@ package distlock
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +14,8 @@ import (
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
 	pkgdistlock "github.com/oekit/pkg/distlock"
+	pkgerrors "github.com/oekit/pkg/errors"
+	stringx "github.com/oekit/pkg/stringx"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/oekit/etcdx/internal/keyseg"
+	"github.com/oekit/etcdx/internal/probe"
 )
 
 var log = logx.Delegating("etcdx.distlock")
@@ -87,11 +88,6 @@ type Locker = pkgdistlock.Locker
 
 const defaultPrefix = "/oekit/distlock"
 
-// connProbeWindow 是加锁链路每一步网络交互的有界窗口（连接预检、租约 Grant
-// 各一个窗口，与调用方 ctx 取较小者）：预检与 Grant 之间 etcd 进入黑洞时，
-// caller 的 deadline 是唯一出口（#111）。
-const connProbeWindow = 3 * time.Second
-
 // EtcdLocker 是基于 etcd Session + concurrency.Mutex 的分布式锁实现。
 type EtcdLocker struct {
 	cli                 *clientv3.Client
@@ -110,6 +106,11 @@ type EtcdLocker struct {
 	// （租约继续续期 ⇒ 锁不释放），且前一个 owner 的 Unlock 因 ownerID 不匹配
 	// 报 ErrNotOwner ⇒ 它的锁也放不掉。
 	held map[string]map[string]*heldLock
+
+	// releaseFunc 仅供包内测试注入释放结果（nil = 走真实 release）。
+	// 释放账本（保留/删除记录）的判据与网络实现解耦，供 data#299 的
+	// 「通信失败保留记录、可重试」用例确定性覆盖。
+	releaseFunc func(context.Context, string, *heldLock) error
 }
 
 type heldLock struct {
@@ -119,6 +120,10 @@ type heldLock struct {
 	// stopSafety 停掉本次持有的「最大持锁时长」安全网 goroutine
 	// （Unlock / Close 时调用；安全网自行触发后由它自己结束）。
 	stopSafety func()
+	// releasing 表示一次 Unlock/Close 的释放正在进行（l.mu 保护）。
+	// 释放失败时记录保留并复位；并发的第二个 Unlock 收到 ErrNotOwner
+	// （与「记录已删除」的单次释放语义一致），不会重复发起 Delete/Revoke。
+	releasing bool
 }
 
 var _ Locker = (*EtcdLocker)(nil)
@@ -260,7 +265,7 @@ func (l *EtcdLocker) Lock(ctx context.Context, key string, ttl, timeout time.Dur
 func (l *EtcdLocker) stageFailed(ctx context.Context, key, stage string, stageErr error) (string, error) {
 	if ctx.Err() != nil {
 		l.notify(key, false, ctx.Err())
-		return "", fmt.Errorf("etcdx distlock: caller context done while %s: %w", stage, ctx.Err())
+		return "", pkgerrors.Wrapf(ctx.Err(), "etcdx distlock: caller context done while %s", stage)
 	}
 	return l.degradeOrFail(key, stageErr)
 }
@@ -271,7 +276,7 @@ func (l *EtcdLocker) stageFailed(ctx context.Context, key, stage string, stageEr
 func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	do func(ctx context.Context, m *concurrency.Mutex) error) (string, error) {
 	if key == "" {
-		return "", fmt.Errorf("etcdx distlock: key is empty")
+		return "", pkgerrors.New("etcdx distlock: key is empty")
 	}
 	// 键层级边界校验（#138，规则单源见 internal/keyseg）：锁键经 lockKey
 	// 直接拼进 etcd 分层键空间，concurrency.Mutex 的互斥判定用前缀范围查询
@@ -279,23 +284,25 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	// 之内，持有 "a/b" 则 "a" 永远拿不到锁（单向过度互斥，与 registry 侧
 	// #110 的同类约定对齐）。参数错误在任何网络交互前 fail-fast。
 	if err := keyseg.Check("lock key", key); err != nil {
-		return "", fmt.Errorf("etcdx distlock: %w", err)
+		return "", pkgerrors.Wrap(err, "etcdx distlock")
 	}
 	// ttl≤0 与 redisx 对齐直接报错（#62）：同接口下 redisx 的 TryLock 对
 	// ttl≤0 返回 "distlock: ttl must be positive"；此前这里静默抬成 1s——
 	// 同一份调用代码换后端，一个是立刻报错、一个是悄悄持 1s 锁。零值/负值
 	// 是参数错误，在任何网络交互前 fail-fast。
 	if ttl <= 0 {
-		return "", fmt.Errorf("etcdx distlock: ttl must be positive, got %v", ttl)
+		return "", pkgerrors.Newf("etcdx distlock: ttl must be positive, got %v", ttl)
 	}
 	// 连接预检：轻量读在有界窗口内探活，失败直接降级/报错，不做后续网络
-	// 交互（#54 判别见 stageFailed）
-	pctx, pcancel := context.WithTimeout(ctx, connProbeWindow)
+	// 交互（#54 判别见 stageFailed）。窗口数值单源 internal/probe（#111 立值，
+	// registry watch 重建快照重取 #196 接入同源）——预检与 Grant 之间 etcd
+	// 进入黑洞时，caller 的 deadline 是唯一出口。
+	pctx, pcancel := context.WithTimeout(ctx, probe.Window)
 	_, perr := l.cli.Get(pctx, l.prefix)
 	pcancel()
 	if perr != nil {
 		return l.stageFailed(ctx, key, "probing etcd",
-			fmt.Errorf("etcdx distlock: etcd unreachable: %w", perr))
+			pkgerrors.Wrapf(perr, "etcdx distlock: etcd unreachable"))
 	}
 	// 租约精度：etcd 的租约以**秒**为单位 ⇒ (0, 1s) 的亚秒 TTL 抬升至 1s。
 	// （redisx 侧走 SetNX 是精确毫秒 ⇒ 同一个 Locker 接口，200ms 的锁在
@@ -316,17 +323,17 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 	// 不变，创建全程有界，失败走与预检相同的 degradeOrFail 分类。WithTTL
 	// 保留供 Session.Close 的 Revoke 窗口使用（租约实际 TTL 以服务端返回
 	// 为准，与 keepalive 无关）。
-	gctx, gcancel := context.WithTimeout(clientv3.WithRequireLeader(ctx), connProbeWindow)
+	gctx, gcancel := context.WithTimeout(clientv3.WithRequireLeader(ctx), probe.Window)
 	grant, gerr := l.cli.Grant(gctx, int64(ttlSec))
 	gcancel()
 	if gerr != nil {
 		return l.stageFailed(ctx, key, "granting lease",
-			fmt.Errorf("etcdx distlock: grant lease: %w", gerr))
+			pkgerrors.Wrapf(gerr, "etcdx distlock: grant lease"))
 	}
 	session, err := concurrency.NewSession(l.cli, concurrency.WithLease(grant.ID), concurrency.WithTTL(ttlSec))
 	if err != nil {
 		return l.stageFailed(ctx, key, "creating session",
-			fmt.Errorf("etcdx distlock: new session: %w", err))
+			pkgerrors.Wrapf(err, "etcdx distlock: new session"))
 	}
 	m := concurrency.NewMutex(session, l.lockKey(key))
 	if err := do(ctx, m); err != nil {
@@ -343,7 +350,7 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 			l.notify(key, false, err)
 			return "", err
 		}
-		return l.degradeOrFail(key, fmt.Errorf("etcdx distlock: lock %s: %w", key, err))
+		return l.degradeOrFail(key, pkgerrors.Wrapf(err, "etcdx distlock: lock %s", key))
 	}
 	ownerID := newOwnerID()
 	h := &heldLock{ownerID: ownerID, session: session, mutex: m}
@@ -370,15 +377,14 @@ func (l *EtcdLocker) acquire(ctx context.Context, key string, ttl time.Duration,
 // stop 返回的函数用于在 Unlock / Close 时提前终止安全网（此时锁是正常释放的，
 // 不该等到期）。
 func (l *EtcdLocker) startSafetyNet(key, ownerID string, session *concurrency.Session, ttl time.Duration) func() {
-	maxHold := l.maxHold
-	switch {
-	case maxHold < 0:
+	// 三态口径单源:pkg/distlock.MaxLifetime(0→10×ttl、负→0 表不限、正→显式;
+	// #534 照搬 redisx watchdog 语义)。MaxLifetime 返回 <=0 即「无 deadline」:
+	// 仅 WithMaxHold 负值（不限）会落到这里。旧实现的防御分支「10×ttl<=0 时
+	// 兜底 10s」不可达——acquire 对 ttl<=0 在任何网络交互前 fail-fast（#62）,
+	// 走到本函数时 ttl>0 恒成立,10×ttl 恒为正。
+	maxHold := pkgdistlock.MaxLifetime(l.maxHold, ttl)
+	if maxHold <= 0 {
 		return nil // 不限制：完全依赖调用方 Unlock
-	case maxHold == 0:
-		maxHold = 10 * ttl
-		if maxHold <= 0 {
-			maxHold = 10 * time.Second
-		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	async.GoSafe(func() {
@@ -410,36 +416,110 @@ func (l *EtcdLocker) setHeld(key, ownerID string, h *heldLock) {
 }
 
 // Unlock 释放锁：ownerID 须与本进程持有记录一致；释放后 Session 关闭回收租约。
+//
+// # 删除账本的时机（data#299 etcdx 半边）
+//
+// **先释放、成功后再删除 held 记录**：通信类失败（网络瞬断 / ctx 在发
+// Delete/Revoke 前到期）时锁可能仍在 etcd 里，若先把记录删掉，调用方按
+// 契约重试 Unlock 只会得到 ErrNotOwner（=ErrLockNotHeld 终态），锁只能
+// 等 TTL 自然过期。现在失败记录保留并返回可重试错误——同一 (key,
+// ownerID) 可再次 Unlock；释放路径幂等（重复 Delete/Revoke 无害，
+// ErrLockReleased 视作已释放），成功或判定「租约已不存在」后才删记录。
+//
+// 若 Session.Close（撤销租约）成功，则即便 Mutex.Unlock 失败也已达成
+// 「锁键从 etcd 删除」的契约结果（撤销租约删除该会话全部键），按成功
+// 处理并删除记录；仅两次操作都失败才保留记录返回错误。
 func (l *EtcdLocker) Unlock(ctx context.Context, key, ownerID string) error {
 	l.mu.Lock()
 	h := l.held[key][ownerID]
-	if h == nil {
+	if h == nil || h.releasing {
 		l.mu.Unlock()
 		return ErrNotOwner
 	}
-	delete(l.held[key], ownerID)
-	if len(l.held[key]) == 0 {
-		delete(l.held, key)
-	}
+	h.releasing = true
 	l.mu.Unlock()
-	return l.release(ctx, key, h)
+
+	err := l.doRelease(ctx, key, h)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err == nil || errors.Is(err, ErrLockNotHeld) {
+		// 释放成功 / 判定锁已不存在：记录使命结束。
+		l.dropHeldLocked(key, ownerID, h)
+		return err
+	}
+	// 通信类或未知失败：保留记录（复位 releasing），允许同一持有者重试。
+	h.releasing = false
+	return err
 }
 
 // Close 释放本进程持有的全部锁（幂等）。
+//
+// 失败条目**不回填丢失**：账本不再整体交换清空，只有释放成功（或判定
+// 锁已不存在）的条目才删除；失败条目留在 l.held 中，错误经 errors.Join
+// 汇总返回，下一次 Close/Unlock 可继续重试。并发 Unlock 正在释放
+// （releasing）的条目跳过，由其调用方负责结果。
 func (l *EtcdLocker) Close(ctx context.Context) error {
+	type closeEntry struct {
+		key     string
+		ownerID string
+		h       *heldLock
+	}
+
 	l.mu.Lock()
-	held := l.held
-	l.held = make(map[string]map[string]*heldLock)
-	l.mu.Unlock()
-	var errs []error
-	for key, byOwner := range held {
-		for _, h := range byOwner {
-			if err := l.release(ctx, key, h); err != nil {
-				errs = append(errs, err)
+	entries := make([]closeEntry, 0, len(l.held))
+	for key, byOwner := range l.held {
+		for ownerID, h := range byOwner {
+			if h.releasing {
+				continue
 			}
+			h.releasing = true
+			entries = append(entries, closeEntry{key: key, ownerID: ownerID, h: h})
+		}
+	}
+	l.mu.Unlock()
+
+	var errs []error
+	for _, e := range entries {
+		err := l.doRelease(ctx, e.key, e.h)
+		l.mu.Lock()
+		if err == nil || errors.Is(err, ErrLockNotHeld) {
+			l.dropHeldLocked(e.key, e.ownerID, e.h)
+		} else {
+			// 释放失败：条目留在账本，供下一次 Close/Unlock 重试
+			// （不是「先取走 held，失败条目不回填」的旧行为）。
+			e.h.releasing = false
+		}
+		l.mu.Unlock()
+		if err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// dropHeldLocked 删除指定持有记录（调用方须持有 l.mu）。按指针身份校验，
+// 避免误删同 (key, ownerID) 的新记录。
+func (l *EtcdLocker) dropHeldLocked(key, ownerID string, h *heldLock) {
+	byOwner := l.held[key]
+	if byOwner == nil {
+		return
+	}
+	if cur, ok := byOwner[ownerID]; !ok || cur != h {
+		return
+	}
+	delete(byOwner, ownerID)
+	if len(byOwner) == 0 {
+		delete(l.held, key)
+	}
+}
+
+// doRelease 执行一次释放（测试可经 releaseFunc 注入失败结果）。
+func (l *EtcdLocker) doRelease(ctx context.Context, key string, h *heldLock) error {
+	if l.releaseFunc != nil {
+		return l.releaseFunc(ctx, key, h)
+	}
+	return l.release(ctx, key, h)
 }
 
 func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error {
@@ -449,16 +529,27 @@ func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error
 	if h.session == nil { // 降级放行的锁无需释放
 		return nil
 	}
-	var err error
+	var unlockErr error
 	if h.mutex != nil {
-		if uerr := h.mutex.Unlock(ctx); uerr != nil {
-			err = fmt.Errorf("etcdx distlock: unlock %s: %w", key, uerr)
+		uerr := h.mutex.Unlock(ctx)
+		// ErrLockReleased = 上一次释放已经删过键（重试路径的正常形态）。
+		if uerr != nil && !errors.Is(uerr, concurrency.ErrLockReleased) {
+			unlockErr = pkgerrors.Wrapf(uerr, "etcdx distlock: unlock %s", key)
 		}
 	}
-	// 关闭 Session 撤销租约：即便 Unlock 失败，键也随租约撤销删除
-	if cerr := h.session.Close(); cerr != nil && err == nil {
-		err = fmt.Errorf("etcdx distlock: close session %s: %w", key, cerr)
+	// 关闭 Session 撤销租约：即便 Unlock 失败，键也随租约撤销删除。
+	cerr := h.session.Close()
+	if cerr == nil {
+		// 撤销租约成功 ⇒ 该会话的全部键已删除，锁确实释放了。此时
+		// Mutex.Unlock 的失败（典型：caller ctx 已取消）被 Revoke 覆盖，
+		// 不能把成功报成可重试失败——重试反而会撞 ErrLockReleased /
+		// ErrLeaseNotFound 的终态噪音。
+		if unlockErr != nil {
+			log.Warn("mutex unlock failed but session revoke succeeded", "key", key, logx.ErrKey, unlockErr)
+		}
+		return nil
 	}
+	err := errors.Join(unlockErr, pkgerrors.Wrapf(cerr, "etcdx distlock: close session %s", key))
 	// #137：契约（pkg/distlock.Locker.Unlock）——「锁不存在或已易主（陈旧
 	// 持有者解锁）返回 ErrLockNotHeld；其它 error 为后端通信故障」。陈旧
 	// 持有者（租约失效后被他人重新拿锁）在 etcd 侧的表象：Mutex.Unlock 删
@@ -466,8 +557,16 @@ func (l *EtcdLocker) release(ctx context.Context, key string, h *heldLock) error
 	// Revoke 返回 ErrLeaseNotFound——此前该原始 etcd 错误直出，恰好顶替了
 	// 契约点名的「锁已易主」哨兵，调用方无法用 errors.Is 判定「我已不再
 	// 持有」。这里把它翻译成契约哨兵（规则单源见 pkg/distlock 契约原文）。
-	if err != nil && errors.Is(err, rpctypes.ErrLeaseNotFound) {
-		return fmt.Errorf("etcdx distlock: unlock %s: %w", key, ErrLockNotHeld)
+	if errors.Is(err, rpctypes.ErrLeaseNotFound) {
+		// 租约已被回收（TTL 过期 / MaxHold 安全网 / 外部撤销）：无论
+		// Mutex.Unlock 的 Delete 是否幂等成功，本次调用都没有真正释放
+		// 一把仍属于自己的锁 ⇒ 契约哨兵（#137）。重试路径同样收敛于此：
+		// 上一次已删键、只剩撤销失败时，重试拿到本哨兵后记录被清理，
+		// 调用方按「已不再持有」终止重试。
+		if unlockErr != nil {
+			log.Warn("unlock failed and lease already gone", "key", key, logx.ErrKey, unlockErr)
+		}
+		return pkgerrors.Wrapf(ErrLockNotHeld, "etcdx distlock: unlock %s", key)
 	}
 	return err
 }
@@ -534,11 +633,20 @@ func (l *EtcdLocker) lockKey(key string) string {
 	return l.prefix + "/" + key
 }
 
+// newOwnerID 生成锁 ownerID：单源 pkg/stringx.RandomTokenOrFallback
+// （16B → base64.RawURLEncoding，编码值域与旧手搓实现逐形态一致，对拍
+// 已验）。随机源失败按调用方显式选择退时间戳 ID（fallback 保留原降级
+// 逻辑，降级成功返回 nil error——见 pkg godoc）。
 func newOwnerID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	ownerID, err := stringx.RandomTokenOrFallback(16, stringx.TokenBase64RawURL, func() string {
 		// crypto/rand 失败极罕见；退化为时间戳保证非空且基本唯一
 		return fmt.Sprintf("t%d", time.Now().UnixNano())
+	})
+	if err != nil {
+		// RandomTokenOrFallback 仅在参数/用法错误（nBytes<=0、enc 非法、
+		// fallback 为 nil）时返回 error——本调用三参全为编译期字面量合法值，
+		// 此分支理论不可达；若触发即代码被改坏的确定性信号，fail-fast 不静默。
+		panic("etcdx distlock: newOwnerID 参数为编译期常量，RandomTokenOrFallback 不应返回 error: " + err.Error())
 	}
-	return base64.RawURLEncoding.EncodeToString(b[:])
+	return ownerID
 }

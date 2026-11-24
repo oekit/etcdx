@@ -6,6 +6,8 @@ import (
 
 	"github.com/oekit/logx"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/oekit/etcdx/internal/probe"
 )
 
 // runWatchLoop 是 Subscriber.Subscribe 与 ConfigStore.ListenConfig 共用的
@@ -65,9 +67,18 @@ func runWatchLoop(
 		select {
 		case <-h.ctx.Done():
 			return
-		case <-time.After(watchBackoff(attempts)):
+		case <-time.After(backoffFor(attempts)):
 		}
-		nextRev, deliver, err := resnap(h.ctx)
+		// 快照重取套探活窗口（#196）：h.ctx 由 WithCancel(Background) 派生、
+		// 无 deadline——etcd 半开连接/网络黑洞时 resnap 内的 Get 无限挂起，
+		// 退避 attempts 不再推进，订阅/配置监听静默停更。窗口与 distlock
+		// 加锁链路同值单源（internal/probe，#111 立值）；窗口到期 ⇒ Get 以
+		// DeadlineExceeded 失败 ⇒ 走下方既有 attempts++ 退避路径，重建行为
+		// 闭环不变。deliver 闭包只用已取回的数据，pctx 提前 cancel 不影响
+		// 后续补投递。
+		pctx, pcancel := context.WithTimeout(h.ctx, probe.Window)
+		nextRev, deliver, err := resnap(pctx)
+		pcancel()
 		if err != nil {
 			attempts++ // 每轮快照重取失败 attempts++（#85）
 			log.Warn("snapshot refresh for watch rebuild failed, retrying",

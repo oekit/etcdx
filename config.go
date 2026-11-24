@@ -2,9 +2,10 @@ package etcdx
 
 import (
 	"context"
-	"fmt"
+	stderrors "errors"
 	"time"
 
+	errors "github.com/oekit/pkg/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -36,10 +37,29 @@ func NewClientFromConfig(ctx context.Context, cfg EtcdConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := c.Health(ctx); err != nil {
-		// 探活失败也要回收已创建的 client（gRPC 连接已建立）
-		_ = c.Close(ctx)
-		return nil, fmt.Errorf("etcdx: ping failed: %w", err)
+	if err := healthOrCleanup(ctx, c); err != nil {
+		return nil, err
 	}
 	return c, nil
+}
+
+// healthOrCleanup 连通性探测：Health 失败时回收已创建的 client（gRPC 连接
+// 已建立），并把回收失败一并上抛（#184，对齐 redisx#149 口径）。
+//
+// 契约（本仓错误处理硬规则：所有 error 禁止 `_` 忽略）：gRPC 连接已建立而
+// Health 失败，恰是唯一一次能观测到连接回收失败（半开连接、fd 回收失败）
+// 的时机，回收错误不得静默丢弃——与 Health 错误经 errors.Join 聚合上抛
+// （两侧各自 %w 包装，errors.Is/As 判定口径不变）；回收成功时返回口径与
+// 历史一致（仅 Health 错误）。回收走 Client.Close(ctx) 幂等单源。
+func healthOrCleanup(ctx context.Context, c *Client) error {
+	if err := c.Health(ctx); err != nil {
+		if cerr := c.Close(ctx); cerr != nil {
+			return stderrors.Join(
+				errors.Wrapf(err, "etcdx: ping failed"),
+				errors.Wrapf(cerr, "etcdx: close failed"),
+			)
+		}
+		return errors.Wrapf(err, "etcdx: ping failed")
+	}
+	return nil
 }

@@ -3,15 +3,17 @@ package registry
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
+	pkgerrors "github.com/oekit/pkg/errors"
 	regcore "github.com/oekit/registry"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/oekit/etcdx/internal/probe"
 )
 
 var log = logx.Delegating("etcdx.registry")
@@ -102,7 +104,15 @@ func (r *Registrar) Register(ctx context.Context, inst regcore.Instance) error {
 	delete(r.regs, key)
 	r.mu.Unlock()
 	if old != nil {
-		_ = r.stop(ctx, old) // 旧注册清理失败不阻断新注册；旧租约由 TTL 兜底
+		// 替换旧注册的 stop 失败不再 `_ =` 吞错（#196，与 putWithLease / 二次
+		// 落闸竞态两条 Revoke 失败路径同取 #126 口径）：这是唯一产生孤儿租约的
+		// 场景——旧注册已出 regs 表（上方 delete）、其 supervise 已 cancel，
+		// Deregister/Close 都收不到它，Revoke 失败若无日志痕迹，孤儿租约只能
+		// 等 TTL 兜底过期且全程不可观测。记 Warn 留痕，不阻断新注册。
+		if serr := r.stop(ctx, old); serr != nil {
+			log.Warn("stop old registration during replace failed, left to TTL reap",
+				"key", key, "lease", old.lease(), logx.ErrKey, serr)
+		}
 	}
 
 	leaseID, err := r.putWithLease(ctx, key, string(val))
@@ -175,7 +185,7 @@ func (r *Registrar) Close(ctx context.Context) error {
 	var errs []error
 	for key, reg := range regs {
 		if err := r.stop(ctx, reg); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", key, err))
+			errs = append(errs, pkgerrors.Wrapf(err, "%s", key))
 		}
 	}
 	return errors.Join(errs...)
@@ -190,7 +200,7 @@ func (r *Registrar) stop(ctx context.Context, reg *registration) error {
 		return nil
 	}
 	if _, err := r.cli.Revoke(ctx, id); err != nil && !errors.Is(err, rpctypes.ErrLeaseNotFound) {
-		return fmt.Errorf("etcdx registry: revoke lease %x: %w", id, err)
+		return pkgerrors.Wrapf(err, "etcdx registry: revoke lease %x", id)
 	}
 	return nil
 }
@@ -199,7 +209,7 @@ func (r *Registrar) stop(ctx context.Context, reg *registration) error {
 func (r *Registrar) putWithLease(ctx context.Context, key, val string) (clientv3.LeaseID, error) {
 	grant, err := r.cli.Grant(ctx, r.opt.ttlSeconds())
 	if err != nil {
-		return clientv3.NoLease, fmt.Errorf("etcdx registry: grant lease: %w", err)
+		return clientv3.NoLease, pkgerrors.Wrapf(err, "etcdx registry: grant lease")
 	}
 	if _, err := r.cli.Put(ctx, key, val, clientv3.WithLease(grant.ID)); err != nil {
 		// 回滚刚申请的租约：Revoke 失败不再 `_, _` 吞错（#126，同仓内
@@ -209,7 +219,7 @@ func (r *Registrar) putWithLease(ctx context.Context, key, val string) (clientv3
 			log.Warn("revoke lease after put failed, left to TTL reap",
 				"key", key, "lease", grant.ID, logx.ErrKey, rerr)
 		}
-		return clientv3.NoLease, fmt.Errorf("etcdx registry: put %s: %w", key, err)
+		return clientv3.NoLease, pkgerrors.Wrapf(err, "etcdx registry: put %s", key)
 	}
 	return grant.ID, nil
 }
@@ -237,10 +247,18 @@ func (r *Registrar) supervise(ctx context.Context, key, val string, reg *registr
 }
 
 // reRegister 退避重试直到成功或 ctx 取消；返回是否成功。
+// 退避派生与 watch 重建收敛同一单源 backoffFor（#186）：1s 起、30s 封顶
+// （公式与护栏单源 concurrency/retry.SaturatedBackoff，#204 收编；封顶后
+// 恒 30s）。
 func (r *Registrar) reRegister(ctx context.Context, key, val string, reg *registration) bool {
-	backoff := time.Second
-	for {
-		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	for attempts := 0; ; attempts++ {
+		// 单次重注册套探活窗口（#202）：supervise 的 ctx 由 WithCancel 派生、
+		// 无 deadline，etcd 半开连接/网络黑洞下 Grant/Put 可能无限挂起——此前
+		// 此处硬编码 5s 超时，数值游离在探活单源之外；改用 probe.Window 收口
+		// （#196 watch resnap 接入的同一单源，distlock#111 立值）。窗口到期 ⇒
+		// putWithLease 以 DeadlineExceeded 失败 ⇒ 走下方既有 attempts++ 退避
+		// 路径，重注册闭环不变。
+		rctx, cancel := context.WithTimeout(ctx, probe.Window)
 		id, err := r.putWithLease(rctx, key, val)
 		cancel()
 		if err == nil {
@@ -248,14 +266,12 @@ func (r *Registrar) reRegister(ctx context.Context, key, val string, reg *regist
 			log.Info("instance re-registered", "key", key, "lease", id)
 			return true
 		}
+		backoff := backoffFor(attempts)
 		log.Warn("re-register failed, will retry", "key", key, "backoff", backoff, logx.ErrKey, err)
 		select {
 		case <-ctx.Done():
 			return false
 		case <-time.After(backoff):
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
 		}
 	}
 }

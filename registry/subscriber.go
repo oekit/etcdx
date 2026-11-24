@@ -2,16 +2,16 @@ package registry
 
 import (
 	"context"
-	"fmt"
 	"runtime/debug"
-	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/oekit/concurrency/async"
+	"github.com/oekit/concurrency/retry"
 	"github.com/oekit/logx"
+	errors "github.com/oekit/pkg/errors"
 	regcore "github.com/oekit/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/oekit/etcdx/internal/probe"
 )
 
 // Subscriber 是 regcore.Subscriber 的 etcd 实现：Watch 服务前缀，任一实例
@@ -20,16 +20,10 @@ type Subscriber struct {
 	cli *clientv3.Client
 	opt *Option
 
-	mu   sync.Mutex
-	subs map[string]*watchHandle // 服务名 → 订阅句柄
-
-	// retired 承载已 Unsubscribe/Close 摘除、但观察 goroutine 尚未退出的句柄
-	// （#149）：#84 的交接（新订阅等旧 goroutine 退出后才投递）不能依赖
-	// 「旧句柄还在 subs 里」——先删 map 再 supersede 的旧实现让退订后重建的
-	// 订阅读到 old==nil，交接整段被绕过，新旧回调并发。同一名字至多存在于
-	// subs/retired 之一（Subscribe 转移时原子完成）；槽位由观察 goroutine
-	// 退出时按身份自清（dropRetiredHandle），无订阅重建时也不残留。
-	retired map[string]*watchHandle
+	// reg 登记订阅句柄（#185 单源）：登记/替换/supersede 交接/摘除/关闭与
+	// retired 待退出槽位（#149）与 ConfigStore 同构，只此一份实现，见
+	// watchRegistry。
+	reg *watchRegistry[string]
 }
 
 var _ regcore.Subscriber = (*Subscriber)(nil)
@@ -44,7 +38,7 @@ func NewSubscriber(cli *clientv3.Client, opts ...OptionFunc) (*Subscriber, error
 	}
 	return &Subscriber{
 		cli: cli, opt: applyOptions(opts),
-		subs: make(map[string]*watchHandle), retired: make(map[string]*watchHandle),
+		reg: newWatchRegistry[string](),
 	}, nil
 }
 
@@ -63,7 +57,7 @@ func NewSubscriber(cli *clientv3.Client, opts ...OptionFunc) (*Subscriber, error
 // 此前先删 map 再 supersede，重建订阅读到 old==nil，交接被绕过）。
 func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func([]regcore.Instance)) error {
 	if serviceName == "" {
-		return fmt.Errorf("etcdx registry: service name is empty")
+		return errors.New("etcdx registry: service name is empty")
 	}
 	// 键层级边界 fail-fast（#110）：含 "/" 的服务/分组名拼出的 watch 前缀
 	// 会越界命中其他服务的键空间，快照里混入解码成 Service="order" 的
@@ -75,59 +69,34 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 		return err
 	}
 	if cb == nil {
-		return fmt.Errorf("etcdx registry: subscribe callback is nil")
+		return errors.New("etcdx registry: subscribe callback is nil")
 	}
 	dir := serviceDir(s.opt.Prefix, s.opt.Group, serviceName)
 
 	// 先取一次快照并记录 revision，Watch 从 revision+1 起不漏事件
 	resp, err := s.cli.Get(ctx, dir, clientv3.WithPrefix())
 	if err != nil {
-		return fmt.Errorf("etcdx registry: subscribe get %s: %w", serviceName, err)
+		return errors.Wrapf(err, "etcdx registry: subscribe get %s", serviceName)
 	}
 	startRev := resp.Header.Revision + 1
 
 	h := newWatchHandle()
-	s.mu.Lock()
-	old := s.subs[serviceName]
-	if old == nil {
-		// 退订/关停后的重建订阅（#149）：旧句柄已从 subs 摘除但可能仍在
-		// 退出中，交接等待改读 retired 槽位——「先删 map」不得让 #84 的
-		// 等旧 goroutine 退出整段失效
-		old = s.retired[serviceName]
-		delete(s.retired, serviceName)
-	}
-	if old != nil {
-		old.supersede() // 标记取代 + cancel：旧 goroutine 不再投递（仅 cancel 不交接，#84）
-	}
-	s.subs[serviceName] = h
-	s.mu.Unlock()
+	// 登记与 supersede 交接单源到 watchRegistry.install（#185）：同 key 旧
+	// 句柄（活跃表或 retired 槽位，#149——退订/关停后的重建）被标记取代，
+	// 新订阅须等其 goroutine 退出后才投递（#84）。
+	old := s.reg.install(serviceName, h)
 
 	// 观察循环（#55）：watch 被取消（ErrCompacted——长驻订阅 + auto-compaction
 	// 是生产常态；etcd-server 重启等）或通道关闭后**指数退避重建**（重取快照 +
 	// 新 revision），对齐注册侧「丢约指数退避自动重注册」的对等韧性。此前只打
-	// 一条 Warn 就 return：订阅留在 subs map、Unsubscribe「正常」返回，但此后
+	// 一条 Warn 就 return：订阅留在登记表、Unsubscribe「正常」返回，但此后
 	// 永不回调——服务实例列表/配置推送几天后无声停更，消费方拿过期快照继续跑。
 	//
-	// #84：首次快照投递前先等被替换的旧 goroutine 退出（回调不可能并发），
-	// 之后所有投递前检查 superseded，被取代/退订后的过期快照一律丢弃。
-	async.GoSafe(func() {
-		defer func() {
-			h.close()
-			// #149：观察 goroutine 退出后从 retired 槽位摘除自己（身份
-			// 校验：名字可能已被后续订阅/退订重新占用）。先 close(done) 再
-			// 摘除，保持「槽位还在 ⇒ goroutine 可能仍在回调」的不变式。
-			s.dropRetired(serviceName, h)
-		}()
-		if old != nil {
-			select {
-			case <-old.done: // 旧 goroutine 已退出：此后才允许本订阅投递
-			case <-h.ctx.Done():
-				return // 等待期间本订阅又被取代/退订：不投递
-			}
-		}
-		if h.superseded.Load() {
-			return
-		}
+	// #84/#149 的 goroutine 交接块（等 old.done → superseded 检查 →
+	// defer{close(done); dropRetired}）单源在 watchRegistry.run（#185）：
+	// 首次快照投递前先等被替换的旧 goroutine 退出（回调不可能并发），之后
+	// 所有投递前检查 superseded，被取代/退订后的过期快照一律丢弃。
+	s.reg.run(serviceName, h, old, func() {
 		// 首次快照：与后续事件同一条串行路径（#84），不再是「同步第一次 +
 		// 异步后续」两条交错路径。cb panic 由 safeNotify 就地收编（#87）。
 		snap := decodeAll(serviceName, s.opt.Group, dir, resp)
@@ -150,7 +119,16 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 				if len(wresp.Events) == 0 {
 					return
 				}
-				insts, err := fetchInstances(h.ctx, s.cli, s.opt.Prefix, s.opt.Group, serviceName)
+				// 事件批取数套探活窗口（#202）：h.ctx 由 WithCancel(Background)
+				// 派生、无 deadline——etcd 半开连接/网络黑洞下 fetchInstances 内
+				// 的 Get 无限挂起，onEvent 卡死不返回，后续事件全部积压，订阅
+				// 静默停更（与 #196 resnap 修复同型）。窗口数值单源 internal/probe
+				// （distlock#111 立值、#196 watch resnap 接入）；窗口到期 ⇒ Get
+				// 以 DeadlineExceeded 失败 ⇒ 走下方既有 Warn 丢弃分支，watch
+				// 循环与退避闭环不变（形态与 watchloop.go 的 resnap 窗口一致）。
+				fctx, fcancel := context.WithTimeout(h.ctx, probe.Window)
+				insts, err := fetchInstances(fctx, s.cli, s.opt.Prefix, s.opt.Group, serviceName)
+				fcancel()
 				if err != nil {
 					if h.ctx.Err() != nil {
 						return // 取数窗口内被退订：runWatchLoop 统一退出
@@ -180,52 +158,25 @@ func (s *Subscriber) Subscribe(ctx context.Context, serviceName string, cb func(
 
 // Unsubscribe 取消订阅（未订阅为 no-op）。
 //
-// 摘除的句柄先进入 retired 待退出槽位而非直接丢弃（#149）：其观察 goroutine
-// 可能仍在执行消费方回调，后续同服务 Subscribe 靠该槽位拿到 old.done 完成
-// #84 交接——先删 map 再 supersede 会让交接整段失效（退订后重建订阅与旧回调
-// 并发）。本方法不等待旧回调返回（不阻塞退订方）；槽位由观察 goroutine 退出
-// 时自清，不会随退订次数累积。
+// 摘除的句柄先进入 retired 待退出槽位而非直接丢弃（#149；摘除/槽位逻辑
+// 单源见 watchRegistry.remove，#185）：其观察 goroutine 可能仍在执行消费方
+// 回调，后续同服务 Subscribe 靠该槽位拿到 old.done 完成 #84 交接——先删表
+// 再 supersede 会让交接整段失效（退订后重建订阅与旧回调并发）。本方法不
+// 等待旧回调返回（不阻塞退订方）；槽位由观察 goroutine 退出时自清，不会随
+// 退订次数累积。
 func (s *Subscriber) Unsubscribe(_ context.Context, serviceName string) error {
-	s.mu.Lock()
-	h := s.subs[serviceName]
-	if h != nil {
-		delete(s.subs, serviceName)
-		s.retired[serviceName] = h // #149：摘除后仍可被重建订阅读到（同名至多一个）
-	}
-	s.mu.Unlock()
-	if h != nil {
-		h.supersede()
-	}
+	s.reg.remove(serviceName)
 	return nil
 }
 
 // Close 取消全部订阅。
 //
-// 被取消的句柄同样转入 retired 待退出槽位（#149，与 Unsubscribe 同口径）：
-// Close 之后立即重建订阅仍须等旧 goroutine 退出，回调不并发。
+// 被取消的句柄同样转入 retired 待退出槽位（#149，与 Unsubscribe 同口径；
+// 单源见 watchRegistry.closeAll）：Close 之后立即重建订阅仍须等旧 goroutine
+// 退出，回调不并发。
 func (s *Subscriber) Close(_ context.Context) error {
-	s.mu.Lock()
-	subs := s.subs
-	s.subs = make(map[string]*watchHandle)
-	for name, h := range subs {
-		s.retired[name] = h // subs/retired 同名不相交（见 retired 字段注释）
-	}
-	s.mu.Unlock()
-	for _, h := range subs {
-		h.supersede()
-	}
+	s.reg.closeAll()
 	return nil
-}
-
-// dropRetired 观察 goroutine 退出时把自身从 retired 槽位摘除（身份校验：
-// 非本句柄则不动——名字可能已被后续订阅/退订重新占用）。Subscriber 与
-// ConfigStore 各持自己的 map，逻辑同构（#149）。
-func (s *Subscriber) dropRetired(name string, h *watchHandle) {
-	s.mu.Lock()
-	if s.retired[name] == h {
-		delete(s.retired, name)
-	}
-	s.mu.Unlock()
 }
 
 func decodeAll(service, group, dir string, resp *clientv3.GetResponse) []regcore.Instance {
@@ -246,34 +197,6 @@ func decodeAll(service, group, dir string, resp *clientv3.GetResponse) []regcore
 	return out
 }
 
-// watchHandle 记录一个活跃 watch 订阅（Subscriber 与 ConfigStore 共用）：
-// cancel 终止 watch；done 在观察 goroutine 退出时关闭——替换方以此建立
-// 「旧 goroutine 不会再回调」的事实（#84：cancel 只会打断阻塞中的 Watch/
-// Get，不会等待正在执行的回调返回）；superseded 标记本订阅已被同 key 的新
-// 订阅或停止操作取代，被取代的 goroutine 丢弃一切未投递的快照直接退出。
-type watchHandle struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	done       chan struct{}
-	superseded atomic.Bool
-}
-
-func newWatchHandle() *watchHandle {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &watchHandle{ctx: ctx, cancel: cancel, done: make(chan struct{})}
-}
-
-// supersede 标记本订阅被取代：丢弃后续投递并终止观察 goroutine。
-func (h *watchHandle) supersede() {
-	h.superseded.Store(true)
-	h.cancel()
-}
-
-// close 由观察 goroutine defer 调用：退出即关闭 done，交接给新订阅。
-func (h *watchHandle) close() {
-	close(h.done)
-}
-
 // safeNotify 就地收编消费者回调的 panic（#87）：观察循环跑在 async.GoSafe
 // 的 goroutine 里，其兜底 recover 之后 goroutine 直接退出——回调一次 panic
 // 就杀死整条观察循环（#55/#64 修出的重建、退避、快照投递全部失效），订阅
@@ -291,22 +214,30 @@ func safeNotify(target string, notify func()) {
 	notify()
 }
 
-// watch 重建的退避参数（Subscriber 与 ConfigStore 共用口径，#85）。
+// 指数退避的共享参数（#186 单源：注册侧 reRegister 与 watch 重建——
+// Subscriber/ConfigStore 共用 runWatchLoop——同一策略只此一份实现）。
+// 公式与护栏单源 concurrency/retry（#204 收编）：backoffFor 薄委托
+// retry.SaturatedBackoff，本仓不再手抄移位实现；backoffMaxAttempts 钳位
+// 常量随之删除（SaturatedBackoff 内部含溢出饱和护栏，见 backoffFor），
+// 本地只保留两个委托参数。
 const (
-	watchBackoffBase  = time.Second // 首轮退避
-	watchBackoffMax   = 30 * time.Second
-	watchBackoffSteps = 5 // 1s<<5 = 32s ≥ 上限，attempts 封顶即不再增长
+	backoffBase = time.Second // 首轮退避
+	backoffMax  = 30 * time.Second
 )
 
-// watchBackoff 由连续重建失败次数派生单轮退避：min(上限, 基数<<attempts)。
-// 成功重建后调用方将 attempts 归零 ⇒ 退避随之归零（#85）。
-func watchBackoff(attempts int) time.Duration {
-	if attempts > watchBackoffSteps {
-		attempts = watchBackoffSteps
-	}
-	d := watchBackoffBase << uint(attempts)
-	if d > watchBackoffMax {
-		return watchBackoffMax
-	}
-	return d
+// backoffFor 由连续失败次数派生单轮指数退避：1s 起、30s 封顶。
+//
+// #204 收编：函数体薄委托 retry.SaturatedBackoff(backoffBase, backoffMax,
+// attempts+1)——公式（initial * 2^(attempt-1)，受 maxDelay 封顶）与溢出
+// 饱和护栏（#283：翻倍即将溢出时取封顶值，不回绕）单源 concurrency/retry
+// （#128 立约「预计算与实跑同源」、#362 收敛监督重启侧手抄版），本仓的
+// 移位手抄版不再各自漂移。参数映射：attempts 是 0 基准连续失败数、
+// SaturatedBackoff 的 attempt 是 1 基准（第 attempt 次失败）⇒ 传
+// attempts+1；attempts 为负时 SaturatedBackoff 按 attempt<1 视为 1 处理
+// （等价旧实现的负值按 0 起步）；attempts 极大时内部溢出饱和到封顶值
+// （原 backoffMaxAttempts 本地钳位职责由其接管）。封顶语义不变：attempts
+// ≥ 5（1s<<5 = 32s > 30s）后恒 30s。成功重建/重注册后调用方将 attempts
+// 归零 ⇒ 退避随之归零（#85）。
+func backoffFor(attempts int) time.Duration {
+	return retry.SaturatedBackoff(backoffBase, backoffMax, attempts+1)
 }
