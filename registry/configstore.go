@@ -12,7 +12,7 @@ import (
 // 监听即 Watch 该键。
 type ConfigStore struct {
 	cli *clientv3.Client
-	opt *Option
+	opt *RegistryOption
 
 	// reg 登记监听句柄（#185 单源）：登记/替换/supersede 交接/摘除/关闭与
 	// retired 待退出槽位（#149）与 Subscriber 同构，只此一份实现，见
@@ -26,7 +26,7 @@ var _ regcore.ConfigStore = (*ConfigStore)(nil)
 //
 // client 为 nil 时返回 ErrNilClient（构造期 fail-fast，避免首次读写时在
 // cli.Get/cli.Put 上空指针崩溃）。
-func NewConfigStore(cli *clientv3.Client, opts ...OptionFunc) (*ConfigStore, error) {
+func NewConfigStore(cli *clientv3.Client, opts ...RegistryOptionFunc) (*ConfigStore, error) {
 	if cli == nil {
 		return nil, ErrNilClient
 	}

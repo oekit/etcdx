@@ -23,7 +23,7 @@ var log = logx.Delegating("etcdx.registry")
 // 指数退避重注册，直到 Deregister/Close 显式停止。
 type Registrar struct {
 	cli *clientv3.Client
-	opt *Option
+	opt *RegistryOption
 
 	// registerMu 串行化 Register 的「替换旧注册」全程（#67）。Register 的
 	// 三段式——锁内摘旧 → 放锁做网络 I/O（Grant+Put）→ 回锁写入——在两个
@@ -65,7 +65,7 @@ var _ regcore.Registrar = (*Registrar)(nil)
 //
 // client 为 nil 时返回 ErrNilClient（构造期 fail-fast，避免首次注册时在
 // cli.Put 上空指针崩溃）。
-func NewRegistrar(cli *clientv3.Client, opts ...OptionFunc) (*Registrar, error) {
+func NewRegistrar(cli *clientv3.Client, opts ...RegistryOptionFunc) (*Registrar, error) {
 	if cli == nil {
 		return nil, ErrNilClient
 	}
