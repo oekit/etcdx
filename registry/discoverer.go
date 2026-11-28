@@ -14,7 +14,7 @@ import (
 // Discoverer 是 regcore.Discoverer 的 etcd 实现：按服务前缀一次 Get 拉取全部实例。
 type Discoverer struct {
 	cli *clientv3.Client
-	opt *Option
+	opt *RegistryOption
 }
 
 var _ regcore.Discoverer = (*Discoverer)(nil)
@@ -23,7 +23,7 @@ var _ regcore.Discoverer = (*Discoverer)(nil)
 //
 // client 为 nil 时返回 ErrNilClient（构造期 fail-fast，避免首次发现时在
 // cli.Get 上空指针崩溃）。
-func NewDiscoverer(cli *clientv3.Client, opts ...OptionFunc) (*Discoverer, error) {
+func NewDiscoverer(cli *clientv3.Client, opts ...RegistryOptionFunc) (*Discoverer, error) {
 	if cli == nil {
 		return nil, ErrNilClient
 	}

@@ -18,7 +18,7 @@ import (
 // 键增删改后重新拉取全量快照回调。订阅建立时立即回调一次当前快照。
 type Subscriber struct {
 	cli *clientv3.Client
-	opt *Option
+	opt *RegistryOption
 
 	// reg 登记订阅句柄（#185 单源）：登记/替换/supersede 交接/摘除/关闭与
 	// retired 待退出槽位（#149）与 ConfigStore 同构，只此一份实现，见
@@ -32,7 +32,7 @@ var _ regcore.Subscriber = (*Subscriber)(nil)
 //
 // client 为 nil 时返回 ErrNilClient（构造期 fail-fast，避免首次订阅时在
 // cli.Get 上空指针崩溃）。
-func NewSubscriber(cli *clientv3.Client, opts ...OptionFunc) (*Subscriber, error) {
+func NewSubscriber(cli *clientv3.Client, opts ...RegistryOptionFunc) (*Subscriber, error) {
 	if cli == nil {
 		return nil, ErrNilClient
 	}

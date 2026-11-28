@@ -11,8 +11,8 @@ const (
 	defaultTTL    = 30 * time.Second
 )
 
-// Option 是本包各组件的共享配置。
-type Option struct {
+// RegistryOption 是本包各组件的共享配置（裸 Option 命名违反硬规则「Option 命名 XxxOption」，下一 minor 对齐同仓 distlock 的 EtcdLockerOption 风格）。
+type RegistryOption struct {
 	// Prefix 是全部键的根前缀（默认 "/oekit/registry"），自动去尾部 "/"。
 	Prefix string
 	// Group 是 Instance.Group 为空时使用的默认分组（默认 "DEFAULT_GROUP"）。
@@ -25,26 +25,26 @@ type Option struct {
 // 亚秒锁 TTL 抬升明示（#62）同款，测试同源断言，不复制字符串字面量。
 const clampWarnMsg = "sub-second ttl raised to 1s (etcd lease granularity is seconds)"
 
-// OptionFunc 配置函数类型。
-type OptionFunc func(*Option)
+// RegistryOptionFunc 配置函数类型。
+type RegistryOptionFunc func(*RegistryOption)
 
 // WithPrefix 设置键根前缀。
-func WithPrefix(prefix string) OptionFunc {
-	return func(o *Option) { o.Prefix = prefix }
+func WithPrefix(prefix string) RegistryOptionFunc {
+	return func(o *RegistryOption) { o.Prefix = prefix }
 }
 
 // WithGroup 设置默认分组。
-func WithGroup(group string) OptionFunc {
-	return func(o *Option) { o.Group = group }
+func WithGroup(group string) RegistryOptionFunc {
+	return func(o *RegistryOption) { o.Group = group }
 }
 
 // WithTTL 设置注册租约时长（秒级精度，不足 1s 按 1s 计）。
-func WithTTL(ttl time.Duration) OptionFunc {
-	return func(o *Option) { o.TTL = ttl }
+func WithTTL(ttl time.Duration) RegistryOptionFunc {
+	return func(o *RegistryOption) { o.TTL = ttl }
 }
 
-func applyOptions(opts []OptionFunc) *Option {
-	o := &Option{Prefix: defaultPrefix, Group: defaultGroup, TTL: defaultTTL}
+func applyOptions(opts []RegistryOptionFunc) *RegistryOption {
+	o := &RegistryOption{Prefix: defaultPrefix, Group: defaultGroup, TTL: defaultTTL}
 	for _, fn := range opts {
 		if fn != nil {
 			fn(o)
@@ -70,11 +70,11 @@ func applyOptions(opts []OptionFunc) *Option {
 }
 
 // ttlSeconds 返回租约秒数（etcd Grant 以秒为单位）。
-func (o *Option) ttlSeconds() int64 {
+func (o *RegistryOption) ttlSeconds() int64 {
 	return int64(o.TTL / time.Second)
 }
 
-func (o *Option) group(g string) string {
+func (o *RegistryOption) group(g string) string {
 	if g == "" {
 		return o.Group
 	}
